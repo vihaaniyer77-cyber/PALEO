@@ -86,19 +86,6 @@ Raw TESS/Kepler LC
 
 ---
 
-## Files
-
-| File | Description |
-|------|-------------|
-| `evaluate_pipeline.py` | Full pipeline + synthetic dataset generator + evaluation |
-| `evaluate_pipeline_fast.py` | Optimised multi-worker version for large-scale runs |
-| `tess_pipeline_updated.py` | Production TESS sector pipeline (downloads + runs end-to-end) |
-| `test_torch_bls.py` | GPU-native BLS implementation (PyTorch, no CUDA compilation) |
-| `paleo_physics_validator.tex` | LaTeX paper on the PAV architecture |
-| `paleo_cbp_demo.py` | Circumbinary planet geometry detection demo |
-| `paleo_astro_demo.py` | Asteroseismology compatibility demo |
-
----
 
 ## Quick Start
 
