@@ -1,0 +1,784 @@
+# ============================================================
+# PALEO — TESS EXOPLANET DISCOVERY PIPELINE (UPDATED)
+# ============================================================
+# Combines:
+#   - TESS data access from tess_sector98_pipeline.py (MAST, blocklist, masking)
+#   - Calibrated Physics-Aware Validator from evaluate_pipeline.py
+#     (pulsator gate, real-flux BLS, EB 3-gate, Batman chi2)
+#
+# Dependencies: lightkurve, astropy, torch, batman-package,
+#               scipy, pandas, matplotlib, requests, tqdm, astroquery
+
+import os
+import sys
+import glob
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import matplotlib
+matplotlib.use("Agg")          # headless – saves PNG without display
+import matplotlib.pyplot as plt
+import requests
+import lightkurve as lk
+from scipy.signal import find_peaks
+from scipy.ndimage import median_filter
+from scipy.optimize import minimize
+from astropy.timeseries import LombScargle, BoxLeastSquares
+from astroquery.mast import Observations
+try:
+    from astroquery.ipac.nexsci.nasa_exoplanet_archive import NasaExoplanetArchive
+except ImportError:
+    try:
+        from astroquery.nasa_exoplanet_archive import NasaExoplanetArchive
+    except ImportError:
+        NasaExoplanetArchive = None
+        print("[WARN] astroquery NasaExoplanetArchive unavailable — known-planet masking disabled.")
+from tqdm import tqdm
+import batman
+import warnings
+warnings.simplefilter("ignore")
+
+# ==============================================================
+# CONFIG
+# ==============================================================
+MODEL_FILENAME = "tcn_epoch_020.pt"
+SECTOR         = 98
+MAX_TARGETS    = 15000
+DATA_DIR       = "tess_data_processed"   # sector subfolders are created inside here
+OUTPUT_DIR     = f"tess_results_sec{SECTOR}"
+DEVICE         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Catalog URLs used for pre-filtering
+TESS_EBS_URL = (
+    "http://archive.stsci.edu/hlsps/tess-ebs/"
+    "hlsp_tess-ebs_tess_lcf-ffi_s0001-s0026_tess_v1.0_cat.csv"
+)
+TOI_LIST_URL  = (
+    "https://exoplanetarchive.ipac.caltech.edu/cgi-bin/nstedAPI/"
+    "nph-nstedAPI?table=toi&format=csv"
+)
+CTOI_LIST_URL = "https://exofop.ipac.caltech.edu/tess/download_ctoi.php?output=csv"
+
+os.makedirs(DATA_DIR,   exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"[INFO] Using Device: {DEVICE}")
+
+# ==============================================================
+# 1. TCN MODEL
+# ==============================================================
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = int(chomp_size)
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size] if self.chomp_size > 0 else x
+
+
+class ResidualTCNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation,
+                 dropout=0.15, groups_gn=None):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv1  = nn.Conv1d(in_ch, out_ch, kernel_size,
+                                padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.n1     = (nn.GroupNorm(max(1, min(groups_gn, out_ch)), out_ch)
+                       if groups_gn else nn.BatchNorm1d(out_ch))
+        self.relu1  = nn.ReLU()
+        self.drop1  = nn.Dropout(dropout)
+
+        self.conv2  = nn.Conv1d(out_ch, out_ch, kernel_size,
+                                padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.n2     = (nn.GroupNorm(max(1, min(groups_gn, out_ch)), out_ch)
+                       if groups_gn else nn.BatchNorm1d(out_ch))
+        self.relu2  = nn.ReLU()
+        self.drop2  = nn.Dropout(dropout)
+
+        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+        self.relu       = nn.ReLU()
+
+    def forward(self, x):
+        out = self.drop1(self.relu1(self.n1(self.chomp1(self.conv1(x)))))
+        out = self.drop2(self.relu2(self.n2(self.chomp2(self.conv2(out)))))
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TCNEventDetector(nn.Module):
+    def __init__(self, in_ch=1, hidden=128, depth=8, kernel_size=5,
+                 dropout=0.15, groups_gn=None, out_ch=2):
+        super().__init__()
+        dilations = [2 ** i for i in range(depth)]
+        blocks, c_in = [], in_ch
+        for d in dilations:
+            blocks.append(ResidualTCNBlock(c_in, hidden, kernel_size,
+                                           d, dropout, groups_gn))
+            c_in = hidden
+        self.backbone = nn.Sequential(*blocks)
+        self.head     = nn.Conv1d(hidden, out_ch, 1)
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+
+def load_model(path):
+    if not os.path.exists(path):
+        print(f"[ERROR] Model file '{path}' not found.")
+        return None
+    print(f"[INFO] Loading model from {path}...")
+    try:
+        ckpt       = torch.load(path, map_location=DEVICE)
+        state_dict = ckpt.get("model_state", ckpt)
+        config     = ckpt.get("config", {})
+
+        hidden  = config.get("hidden", 128)
+        depth   = config.get("depth", 8)
+        kernel  = config.get("kernel_size", 5)
+        dropout = config.get("dropout", 0.15)
+        gn      = config.get("groups_gn", 8)
+        if any("bn1.weight" in k for k in state_dict):
+            gn = None
+
+        model = TCNEventDetector(in_ch=1, hidden=hidden, depth=depth,
+                                 kernel_size=kernel, dropout=dropout,
+                                 groups_gn=gn).to(DEVICE)
+        # Remap legacy norm layer names
+        new_sd = {}
+        for k, v in state_dict.items():
+            new_k = k.replace("bn1", "n1").replace("gn1", "n1") \
+                      .replace("bn2", "n2").replace("gn2", "n2")
+            new_sd[new_k] = v
+        model.load_state_dict(new_sd, strict=False)
+        model.eval()
+        return model
+    except Exception as e:
+        print(f"[ERROR] Failed to load model: {e}")
+        return None
+
+
+# ==============================================================
+# 2. PHYSICS-AWARE VALIDATOR — CALIBRATED COMPONENTS
+#    (Ported directly from evaluate_pipeline.py)
+# ==============================================================
+
+def detrend_flux(flux, window=241):
+    """Rolling-median detrend (~4.8 d at 30-min cadence).
+    Removes 1-15 d stellar modulation; transit dips (0.04-0.2 d)
+    are <5 % of the window → median is unaffected."""
+    trend = median_filter(flux, size=window, mode="nearest")
+    return flux / np.clip(trend, 1e-6, None)
+
+
+def is_pulsator(time, flux, power_threshold=1.0):
+    """High-frequency LS check (periods 0.5-6 hr).
+    Calibrated threshold: pulsators give peak power 1.2-77,
+    transit harmonics give 0.04-0.28 — no overlap."""
+    f_min = 24.0 / 6.0       # 4 cpd  (6 hr period)
+    f_max = 24.0 / 0.5       # 48 cpd (30 min period)
+    freq  = np.linspace(f_min, f_max, 1000)
+    ls    = LombScargle(time, flux - np.median(flux), normalization="model")
+    return np.max(ls.power(freq)) > power_threshold
+
+
+def is_eclipsing_binary(time, flux, period, t0, duration):
+    """3-gate EB filter (from calibrated evaluate_pipeline.py).
+
+    Gate 1  – absolute depth  > 2.5 % (planet max ≈ 2 %)
+    Gate 2  – secondary eclipse at t0 + P/2  > 10 % of primary AND > 2σ
+    Gate 3  – odd/even asymmetry > 30 %
+    """
+    global_median = np.median(flux)
+    global_std    = np.std(flux)
+    half_dur      = max(duration / 2.0, 0.02)
+
+    # --- Measure primary depth (15th-pctile catches V-shapes) ---
+    transit_depths = []
+    t_scan = t0 % period
+    while t_scan < time[-1]:
+        if t_scan >= time[0]:
+            mask = np.abs(time - t_scan) < half_dur
+            if mask.sum() >= 3:
+                d = global_median - np.percentile(flux[mask], 15)
+                transit_depths.append(d)
+        t_scan += period
+
+    if len(transit_depths) == 0:
+        return False
+    mean_depth = np.mean(transit_depths)
+
+    # Sanity: must be a real dip
+    if mean_depth < 2.0 * global_std:
+        return False
+
+    # Gate 1: absolute depth
+    if mean_depth > 0.025:
+        return True
+
+    # Gate 2: secondary eclipse at half-period
+    secondary_depths = []
+    t_sec = (t0 + period / 2.0) % period
+    while t_sec < time[-1]:
+        if t_sec >= time[0]:
+            mask = np.abs(time - t_sec) < half_dur
+            if mask.sum() >= 3:
+                secondary_depths.append(
+                    global_median - np.percentile(flux[mask], 15)
+                )
+        t_sec += period
+
+    if secondary_depths:
+        sec_depth = np.mean(secondary_depths)
+        if sec_depth > 0.10 * mean_depth and sec_depth > 2.0 * global_std:
+            return True
+
+    # Gate 3: odd/even asymmetry
+    odd_depths, even_depths = [], []
+    n = 0
+    t_scan = t0 % period
+    while t_scan < time[-1]:
+        if t_scan >= time[0]:
+            mask = np.abs(time - t_scan) < half_dur
+            if mask.sum() >= 3:
+                d = global_median - np.percentile(flux[mask], 15)
+                (odd_depths if n % 2 == 0 else even_depths).append(d)
+            n += 1
+        t_scan += period
+
+    if len(odd_depths) >= 2 and len(even_depths) >= 2:
+        d_odd  = np.mean(odd_depths)
+        d_even = np.mean(even_depths)
+        if (d_odd + d_even) > 0:
+            if abs(d_odd - d_even) / (d_odd + d_even) > 0.30:
+                return True
+
+    return False
+
+
+class FoldedValidator:
+    """Batman chi² gain validator (phase-folded, then fit).
+    Adapted from evaluate_pipeline.py."""
+
+    def validate_candidate(self, phase, flux, t_center=0.0,
+                           window_width=0.3):
+        mask    = np.abs(phase - t_center) < (window_width / 2.0)
+        t_local = phase[mask]
+        f_local = flux[mask]
+
+        if len(t_local) < 5:
+            return {"verdict": "REJECTED", "gain": 0.0, "params": {}}
+
+        robust_mid = np.median(np.sort(f_local)[int(len(f_local) * 0.2):]) \
+                     if len(f_local) > 5 else np.median(f_local)
+        chi2_flat  = np.sum((f_local - robust_mid) ** 2) or 1e-10
+
+        def transit_model(params, t):
+            t0_, rp_, dur_ = params
+            p = batman.TransitParams()
+            p.t0  = t0_
+            p.per = 10000.0
+            p.rp  = rp_
+            p.a   = max(2.0, 10000.0 / (np.pi * dur_))
+            p.inc = 90.0; p.ecc = 0.0; p.w = 90.0
+            p.u   = [0.3, 0.3]; p.limb_dark = "quadratic"
+            return batman.TransitModel(p, t).light_curve(p) * robust_mid
+
+        def objective(params):
+            return np.sum((f_local - transit_model(params, t_local)) ** 2)
+
+        bounds  = [(t_center - 0.2, t_center + 0.2), (0.001, 0.8), (0.01, 1.0)]
+        guesses = [t_center, 0.05, 0.1]
+
+        try:
+            res = minimize(objective, guesses, bounds=bounds, method="L-BFGS-B")
+            chi2_transit = res.fun
+            best = res.x
+        except Exception as e:
+            return {"verdict": "ERROR", "gain": 0.0, "params": {}, "error": str(e)}
+
+        gain    = 1.0 - (chi2_transit / chi2_flat)
+        verdict = "VALIDATED" if gain > 0.001 else "REJECTED"
+        return {"verdict": verdict, "gain": gain,
+                "params": {"t0": best[0], "rp": best[1], "dur": best[2]}}
+
+
+# ==============================================================
+# 3. PRE-FILTERING (Catalog-Based — unchanged from original)
+# ==============================================================
+def get_bad_tics():
+    """Downloads known EBs and FPs to build a blocklist."""
+    bad_tics = set()
+    print("[INFO] Building blocklist (catalog-based)...")
+
+    try:
+        eb_df = pd.read_csv(TESS_EBS_URL, comment="#")
+        col   = next((c for c in ["tic_id", "ID"] if c in eb_df.columns),
+                     eb_df.columns[0])
+        bad_tics.update(eb_df[col].astype(str).tolist())
+        print(f"   [OK] {len(bad_tics)} known EBs loaded.")
+    except Exception as e:
+        print(f"   [WARN] TESS-EBs failed: {e}")
+
+    try:
+        toi_df  = pd.read_csv(TOI_LIST_URL)
+        fp_mask = pd.Series(False, index=toi_df.index)
+        for col in ["tfopwg_disp", "toi_p_disposition"]:
+            if col in toi_df.columns:
+                fp_mask |= toi_df[col].isin(["FP", "FA"])
+        if fp_mask.any():
+            bad_tics.update(toi_df[fp_mask]["tic_id"].astype(str).tolist())
+        print(f"   [OK] Total blocklist: {len(bad_tics)} TICs.")
+    except Exception as e:
+        print(f"   [WARN] TOI list failed: {e}")
+
+    return bad_tics
+
+
+_CTOI_DF = None
+
+def get_ctoi_df():
+    global _CTOI_DF
+    if _CTOI_DF is not None:
+        return _CTOI_DF
+    try:
+        df = pd.read_csv(CTOI_LIST_URL)
+        if "TIC ID" in df.columns:
+            df["TIC ID"] = df["TIC ID"].astype(str)
+        _CTOI_DF = df
+    except Exception:
+        _CTOI_DF = pd.DataFrame()
+    return _CTOI_DF
+
+
+def mask_known_planets(time, flux, tic_id):
+    """Mask confirmed planets, TOIs, and CTOIs to prevent re-detection."""
+    mask = np.ones(len(time), dtype=bool)
+
+    try:
+        if NasaExoplanetArchive is None:
+            raise RuntimeError("NasaExoplanetArchive not available")
+        planets = NasaExoplanetArchive.query_criteria(
+            table="pscomppars", where=f"tic_id='TIC {tic_id}'"
+        )
+        for row in (planets or []):
+            try:
+                period = float(row["pl_orbper"].value)
+                t0     = float(row["pl_tranmid"].value) - 2457000.0
+                dur    = float(row["pl_trandur"].value) / 24.0
+                if period > 0 and dur > 0:
+                    ph = (time - t0 + 0.5 * period) % period - 0.5 * period
+                    mask &= np.abs(ph) > 0.6 * dur
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        if NasaExoplanetArchive is None:
+            raise RuntimeError("NasaExoplanetArchive not available")
+        tois = NasaExoplanetArchive.query_criteria(
+            table="toi", where=f"tic_id='{tic_id}'"
+        )
+        for row in (tois or []):
+            try:
+                period = float(row.get("pl_orbper", row.get("period", 0)))
+                t0     = float(row.get("pl_tranmid", row.get("epoch", 0))) - 2457000.0
+                dur    = float(row.get("pl_trandur", row.get("duration", 0))) / 24.0
+                if period > 0 and dur > 0:
+                    ph = (time - t0 + 0.5 * period) % period - 0.5 * period
+                    mask &= np.abs(ph) > 0.6 * dur
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    try:
+        ctoi_df = get_ctoi_df()
+        for _, row in ctoi_df[ctoi_df.get("TIC ID", pd.Series()) ==
+                               str(tic_id)].iterrows():
+            try:
+                period = float(row.get("Period (days)", 0))
+                t0     = float(row.get("Epoch (BJD)", 0)) - 2457000.0
+                dur    = float(row.get("Duration (hrs)", 0)) / 24.0
+                if period > 0 and dur > 0:
+                    ph = (time - t0 + 0.5 * period) % period - 0.5 * period
+                    mask &= np.abs(ph) > 0.6 * dur
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    flux_out = flux.copy()
+    flux_out[~mask] = 1.0
+    return flux_out
+
+
+# ==============================================================
+# 4. DATA DOWNLOAD
+# ==============================================================
+def process_tess_sector(target_name=None, sector_num=SECTOR,
+                         max_targets=MAX_TARGETS):
+    """Download and normalize TESS LCs for a sector via MAST/lightkurve."""
+    print(f"[INFO] Querying MAST for TESS Sector {sector_num}...")
+    get_ctoi_df()
+    bad_tics = get_bad_tics()
+
+    if target_name:
+        tic_clean = str(target_name).replace("TIC", "").strip()
+        if tic_clean in bad_tics:
+            print(f"[WARN] {target_name} is in blocklist. Skipping.")
+            return []
+        chosen_tics = [target_name]
+    else:
+        try:
+            obs = Observations.query_criteria(
+                obs_collection="TESS",
+                sequence_number=sector_num,
+                dataproduct_type="timeseries",
+            )
+            if len(obs) == 0:
+                print(f"[ERROR] No observations for Sector {sector_num}.")
+                return []
+            obs_df    = obs.to_pandas()
+            all_tics  = obs_df["target_name"].astype(str).unique()
+            clean_tics = [f"TIC {t}" for t in all_tics if t not in bad_tics]
+            print(f"   {len(clean_tics)} targets after blocklist filter.")
+
+            import random
+            random.seed(42)
+            random.shuffle(clean_tics)
+            chosen_tics = clean_tics[:min(max_targets, len(clean_tics))]
+            print(f"   Selected {len(chosen_tics)} targets.")
+        except Exception as e:
+            print(f"[ERROR] MAST query failed: {e}")
+            return []
+
+    sector_dir = os.path.join(DATA_DIR, f"sector_{sector_num}")
+    os.makedirs(sector_dir, exist_ok=True)
+    saved_files = []
+
+    print(f"[INFO] Downloading {len(chosen_tics)} lightcurves...")
+    for tic_name in tqdm(chosen_tics, desc="Downloading"):
+        try:
+            out_file = os.path.join(
+                sector_dir,
+                f"{tic_name.replace(' ', '_')}_sec{sector_num}.csv"
+            )
+            if os.path.exists(out_file):
+                saved_files.append(out_file)
+                continue
+
+            sr = lk.search_lightcurve(
+                tic_name, mission="TESS", sector=sector_num,
+                author="SPOC", exptime=120
+            )
+            if len(sr) == 0:
+                continue
+
+            lc = sr.download_all().stitch().remove_nans().remove_outliers(sigma=5)
+            if len(lc.time) < 100:
+                continue
+
+            lc_binned = lc.bin(time_bin_size=0.020833)   # 30-min bins
+            if len(lc_binned.time) < 50:
+                continue
+
+            flux = lc_binned.flux.value.astype(float)
+            time = lc_binned.time.value.astype(float)
+            ok   = np.isfinite(flux) & np.isfinite(time)
+            flux, time = flux[ok], time[ok]
+            if len(flux) < 50:
+                continue
+
+            # Normalise to median ≈ 1
+            med = np.median(flux)
+            if med == 0:
+                continue
+            norm_flux = flux if 0.95 < med < 1.05 else flux / med
+
+            # Mask known transiting planets / TOIs / CTOIs
+            tic_id_num = tic_name.replace("TIC ", "").strip()
+            norm_flux  = mask_known_planets(time, norm_flux, tic_id_num)
+
+            pd.DataFrame({"time": time, "flux": norm_flux}).to_csv(
+                out_file, index=False
+            )
+            saved_files.append(out_file)
+
+        except Exception:
+            pass
+
+    print(f"[INFO] Saved {len(saved_files)} LCs to {sector_dir}.")
+    return sector_dir
+
+
+# ==============================================================
+# 5. PLOTTING
+# ==============================================================
+def plot_discovery(time, flux, period, t0, duration, tic_id, output_dir):
+    """Phase-folded discovery plot matching reference style:
+    grey scatter, Phase [D] x-axis, clean title."""
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    # Phase-fold
+    phase = (time - t0 + 0.5 * period) % period - 0.5 * period  # days
+
+    dur_hr  = duration * 24.0
+    x_limit = min(period / 2.0, 1.5)   # show ±1.5 d or ±P/2, whichever is less
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(12, 8),
+        gridspec_kw={"height_ratios": [1, 1.4]}
+    )
+
+    # ── Panel 1: Full light curve with transit markers ──────────────
+    ax1.scatter(time, flux, s=3, c="#444444", alpha=0.4, rasterized=True)
+
+    t_start, t_end = time.min(), time.max()
+    n0 = int(np.floor((t_start - t0) / period))
+    n1 = int(np.ceil((t_end   - t0) / period))
+    for n in range(n0, n1 + 1):
+        tt = t0 + n * period
+        if t_start <= tt <= t_end:
+            ax1.axvline(tt, color="tomato", alpha=0.6, linewidth=1.2, linestyle="--")
+
+    ax1.set_title(
+        f"TIC {tic_id}  ·  Full LC  |  P = {period:.4f} d  |  dur = {dur_hr:.2f} hr",
+        fontsize=11
+    )
+    ax1.set_xlabel("Time (BTJD)", fontsize=10)
+    ax1.set_ylabel("Normalized Flux", fontsize=10)
+    ax1.grid(True, alpha=0.2, linewidth=0.5)
+    ax1.tick_params(labelsize=9)
+
+    # ── Panel 2: Phase-folded ─────────────────────────────────────
+    ax2.scatter(phase, flux, s=4, c="#333333", alpha=0.45,
+                label=f"\u00b7 TIC {tic_id}", rasterized=True)
+
+    # Subtle shaded transit window
+    ax2.axvspan(-duration / 2, duration / 2, alpha=0.08,
+                color="steelblue", label="Transit window")
+
+    ax2.set_title(
+        f"TIC {tic_id} \u2014 Folded (P={period:.4f} d, dur={dur_hr:.2f} hr)",
+        fontsize=11
+    )
+    ax2.set_xlabel("Phase [D]", fontsize=10)
+    ax2.set_ylabel("Normalized Flux", fontsize=10)
+    ax2.set_xlim(-x_limit, x_limit)
+    ax2.legend(loc="upper right", fontsize=9, framealpha=0.7)
+    ax2.grid(True, alpha=0.2, linewidth=0.5)
+    ax2.tick_params(labelsize=9)
+
+    plt.tight_layout()
+    out_path = os.path.join(plots_dir, f"TIC_{tic_id}_P{period:.4f}.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"   [PLOT] Saved → {out_path}")
+
+
+# ==============================================================
+# 6. MAIN INFERENCE + VALIDATION PIPELINE
+# ==============================================================
+def run_pipeline_on_sector(sector_dir, model, output_file,
+                            sde_threshold=6.0, batch_size=64):
+    """
+    Full PALEO pipeline on all CSVs in sector_dir.
+
+    For each target:
+    1.  Pulsator pre-check  (LS power > 1.0 → skip)
+    2.  TCN structural gate (≥3 peaks required)
+    3.  BLS on detrended flux (SDE > 6.0)
+    4.  Batman phase-fold validator (chi² gain > 0.001)
+    5.  Eclipsing binary rejection (3-gate)
+    6.  Save planet candidate + generate plot
+    """
+    validator   = FoldedValidator()
+    csv_files   = (glob.glob(os.path.join(sector_dir, "*.csv"))
+                   if os.path.isdir(sector_dir) else [])
+
+    print(f"[INFO] Running PALEO on {len(csv_files)} LCs (SDE > {sde_threshold})...")
+
+    candidates  = []
+    n_pulsator  = 0
+    n_tcn_fail  = 0
+    n_bls_fail  = 0
+    n_bat_fail  = 0
+    n_eb_reject = 0
+
+    # ── Batch TCN inference ─────────────────────────────────────
+    all_data = []
+    for fpath in csv_files:
+        try:
+            df   = pd.read_csv(fpath)
+            flux = np.nan_to_num(df["flux"].values.astype(float), nan=1.0)
+            time = df["time"].values.astype(float)
+            tic  = (os.path.basename(fpath).replace("TIC_", "")
+                                           .split("_sec")[0])
+            all_data.append((fpath, tic, time, flux))
+        except Exception:
+            pass
+
+    # Filter pulsators before TCN (saves GPU time)
+    clean_data = []
+    for fpath, tic, time, flux in all_data:
+        if is_pulsator(time, flux):
+            n_pulsator += 1
+        else:
+            clean_data.append((fpath, tic, time, flux))
+
+    print(f"   Pulsators removed  : {n_pulsator}")
+    print(f"   Targets for TCN    : {len(clean_data)}")
+
+    # Padded batch TCN
+    for i in tqdm(range(0, len(clean_data), batch_size), desc="TCN Inference"):
+        batch = clean_data[i:i + batch_size]
+        max_len = max(len(d[3]) for d in batch)
+        padded  = np.array([
+            np.pad(d[3] - 1.0, (0, max_len - len(d[3])), constant_values=0.0)
+            for d in batch
+        ], dtype=np.float32)
+
+        x_tensor = torch.tensor(padded, device=DEVICE).unsqueeze(1)
+        with torch.no_grad():
+            logits = model(x_tensor)
+            probs  = torch.sigmoid(logits[:, 0, :]).cpu().numpy()
+
+        for b_idx, (fpath, tic, time, flux) in enumerate(batch):
+            p_curve = probs[b_idx][:len(flux)]
+            peaks, _ = find_peaks(p_curve, height=0.1, distance=20)
+
+            # Gate 2: structural (≥ 3 peaks)
+            if len(peaks) < 3 or np.mean(p_curve[peaks]) < 0.15:
+                n_tcn_fail += 1
+                continue
+
+            # Gate 3: BLS on detrended flux
+            flux_det = detrend_flux(flux)
+            periods  = np.linspace(0.5, 12.0, 2000)
+            durations = np.linspace(0.04, 0.25, 10)
+
+            try:
+                bls = BoxLeastSquares(time, flux_det)
+                res = bls.power(periods, durations)
+            except Exception:
+                n_bls_fail += 1
+                continue
+
+            best_idx    = np.argmax(res.power)
+            sde         = ((np.max(res.power) - np.mean(res.power))
+                           / (np.std(res.power) + 1e-8))
+            best_period = float(res.period[best_idx])
+            t0_pred     = float(res.transit_time[best_idx])
+            dur_pred    = float(res.duration[best_idx])
+
+            if sde < sde_threshold:
+                n_bls_fail += 1
+                continue
+
+            # Gate 4: Batman chi² shape fit
+            phase        = (time - t0_pred + 0.5 * best_period) % best_period \
+                           - 0.5 * best_period
+            dyn_window   = max(0.1, min(dur_pred * 4, 0.5))
+            val_res      = validator.validate_candidate(
+                phase, flux_det, 0.0, window_width=dyn_window
+            )
+
+            if val_res["verdict"] != "VALIDATED":
+                n_bat_fail += 1
+                continue
+
+            true_dur = val_res["params"]["dur"]
+
+            # Gate 5: EB rejection
+            if is_eclipsing_binary(time, flux_det, best_period,
+                                   t0_pred, true_dur):
+                n_eb_reject += 1
+                continue
+
+            # Survived all gates — record candidate
+            in_tran = np.abs(phase) < (true_dur / 2)
+            depth   = (np.median(flux_det) - np.median(flux_det[in_tran])
+                       if in_tran.sum() > 2 else val_res["params"]["rp"] ** 2)
+
+            print(f"[PLANET] TIC {tic}  P={best_period:.4f} d  "
+                  f"SDE={sde:.1f}  depth={depth*1e6:.0f} ppm")
+
+            # Generate plot
+            out_dir = os.path.dirname(output_file) or OUTPUT_DIR
+            plot_discovery(time, flux_det, best_period, t0_pred,
+                           true_dur, tic, out_dir)
+
+            candidates.append({
+                "tic_id":   tic,
+                "period_d": round(best_period, 6),
+                "sde":      round(sde, 2),
+                "t0_btjd":  round(t0_pred, 5),
+                "duration_hr": round(true_dur * 24, 3),
+                "depth_ppm":   round(depth * 1e6, 1),
+                "phys_gain":   round(val_res["gain"], 4),
+                "pred_rp":     round(val_res["params"]["rp"], 5),
+            })
+
+    # Save catalog
+    print(f"\n[SUMMARY]")
+    print(f"  Pulsator-rejected  : {n_pulsator}")
+    print(f"  TCN-failed (< 3 peaks) : {n_tcn_fail}")
+    print(f"  BLS-failed (SDE < {sde_threshold}) : {n_bls_fail}")
+    print(f"  Batman-rejected    : {n_bat_fail}")
+    print(f"  EB-rejected        : {n_eb_reject}")
+    print(f"  Planet candidates  : {len(candidates)}")
+
+    if candidates:
+        cand_df = pd.DataFrame(candidates).sort_values("sde", ascending=False)
+        cand_df.to_csv(output_file, index=False)
+        print(f"[OUTPUT] Catalog → {output_file}")
+        return cand_df
+
+    print("[INFO] No planet candidates found for this sector.")
+    return pd.DataFrame()
+
+
+# ==============================================================
+# 7. MAIN
+# ==============================================================
+if __name__ == "__main__":
+    print(f"[INFO] PALEO TESS Pipeline — Sector {SECTOR}")
+    print(f"[INFO] Max targets: {MAX_TARGETS}\n")
+
+    model = load_model(MODEL_FILENAME)
+    if model is None:
+        sys.exit(1)
+
+    # Step 1: Download
+    sector_path = process_tess_sector(
+        target_name=None, sector_num=SECTOR, max_targets=MAX_TARGETS
+    )
+
+    # Step 2: Run pipeline
+    if sector_path:
+        catalog_file = os.path.join(OUTPUT_DIR, f"planet_candidates_sec{SECTOR}.csv")
+        run_pipeline_on_sector(
+            sector_dir    = sector_path,
+            model         = model,
+            output_file   = catalog_file,
+            sde_threshold = 6.0,
+        )
+
+    # Step 3: Zip results (Colab compatible)
+    try:
+        import shutil
+        zip_base = OUTPUT_DIR
+        shutil.make_archive(zip_base, "zip", OUTPUT_DIR)
+        print(f"[INFO] Archive: {zip_base}.zip")
+        try:
+            from google.colab import files
+            files.download(f"{zip_base}.zip")
+        except ImportError:
+            print(f"[INFO] (Not in Colab — archive is at {os.path.abspath(zip_base)}.zip)")
+    except Exception as e:
+        print(f"[WARN] Zip failed: {e}")
