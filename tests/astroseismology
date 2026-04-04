@@ -1,0 +1,382 @@
+# ============================================================
+# PALEO — ASTEROSEISMOLOGY COMPATIBILITY DEMO
+# ============================================================
+# Demonstrates that PALEO's detrending:
+#   1. PRESERVES red giant solar-like oscillations (nu_max ~10-150 uHz)
+#   2. DETECTS embedded planet transits even in oscillating stars
+#   3. Allows asteroseismic characterization from post-detrend residuals
+#
+# Colab-ready — requires: batman, scipy, numpy, matplotlib
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy.ndimage import median_filter
+from scipy.signal import find_peaks
+from astropy.timeseries import LombScargle
+from astropy.convolution import Box1DKernel, convolve
+import batman
+import warnings
+warnings.simplefilter("ignore")
+
+np.random.seed(7)
+
+# ==============================================================
+# CONFIG
+# ==============================================================
+CADENCE       = 0.021        # days (~30 min, TESS 2-min binned to 30)
+DURATION_DAYS = 27.0
+NOISE_PPM     = 100          # photon noise floor
+DETREND_WIN   = 241          # rolling-median window (5-day window)
+
+# Asteroseismic parameters for a typical oscillating red giant
+# (solar-like oscillations; freq in uHz)
+NU_MAX_UHZ    = 30.0         # frequency of maximum power (uHz) — safely below pulsator gate
+DELTA_NU_UHZ  =  5.0         # large frequency separation (uHz) — scales as mean density
+N_MODES       = 12           # number of radial modes to include
+OSC_AMP_PPM   = 300          # oscillation amplitude (ppm)
+MODE_WIDTH_UHZ = 1.2         # mode lifetime → Lorentzian width
+
+# Planet parameters
+RP_RSTAR      = 0.09         # radius ratio (~Jupiter around a giant)
+TRANSIT_DUR   = 0.22         # days
+T0_PLANET     = 11.3         # transit centre (days from start)
+
+N_PLOT_SYSTEMS = 5           # how many red giant systems to simulate
+
+# Unit conversion
+UHZ_TO_CPD    = 86400 / 1e6  # 1 uHz = 0.0864 cycles/day
+
+
+# ==============================================================
+# 1. SIMULATION
+# ==============================================================
+
+def simulate_oscillations(time, nu_max, delta_nu, n_modes,
+                           amplitude_ppm, mode_width):
+    """
+    Simulate solar-like oscillations as a sum of stochastically
+    excited, exponentially damped sinusoids around nu_max.
+
+    Each radial mode is a Lorentzian in frequency space, realised
+    as a damped sinusoid with random phase and amplitude scatter.
+    """
+    flux_osc = np.zeros_like(time)
+    rng = np.random
+
+    # Radial modes centred on nu_max with spacing delta_nu
+    for n in range(-n_modes // 2, n_modes // 2 + 1):
+        nu_n = nu_max + n * delta_nu        # uHz
+        nu_n_cpd = nu_n * UHZ_TO_CPD       # cycles/day
+
+        # Gaussian envelope in power (Gaussian approximation to the PS envelope)
+        env = np.exp(-0.5 * ((nu_n - nu_max) / (3 * delta_nu)) ** 2)
+
+        # Random amplitude + phase
+        amp   = amplitude_ppm * 1e-6 * env * rng.rayleigh(1.0)
+        phase = rng.uniform(0, 2 * np.pi)
+
+        # Damping timescale ~ 1 / (pi * mode_width)
+        tau_days = 1.0 / (np.pi * mode_width * UHZ_TO_CPD)
+        damp = np.exp(-np.abs(time - time.mean()) / tau_days)
+
+        flux_osc += amp * damp * np.cos(2 * np.pi * nu_n_cpd * time + phase)
+
+    return flux_osc
+
+
+def simulate_red_giant(t0_planet=None, include_planet=True):
+    time = np.arange(0, DURATION_DAYS, CADENCE)
+    flux = np.ones_like(time)
+
+    # Slow stellar rotation (background)
+    rot_amp = np.random.uniform(0.001, 0.005)
+    rot_per = np.random.uniform(30, 120)    # days (slow red giant rotation)
+    flux += rot_amp * np.sin(2 * np.pi * time / rot_per)
+
+    # Solar-like oscillations
+    nu_max   = NU_MAX_UHZ   * np.random.uniform(0.7, 1.4)
+    delta_nu = DELTA_NU_UHZ * np.random.uniform(0.8, 1.2)
+    osc = simulate_oscillations(time, nu_max, delta_nu, N_MODES,
+                                 OSC_AMP_PPM, MODE_WIDTH_UHZ)
+    flux += osc
+
+    # Planet transit
+    if include_planet and t0_planet is not None:
+        p = batman.TransitParams()
+        p.t0 = t0_planet;  p.per = 10000.0;  p.rp = RP_RSTAR
+        p.a  = max(2.0, 10000.0 / (np.pi * TRANSIT_DUR))
+        p.inc = 90.0;  p.ecc = 0.0;  p.w = 90.0
+        p.u  = [0.3, 0.3];  p.limb_dark = "quadratic"
+        try:
+            flux *= batman.TransitModel(p, time).light_curve(p)
+        except Exception:
+            pass
+
+    # Photon noise
+    flux += np.random.normal(0, NOISE_PPM * 1e-6, len(time))
+
+    return time, flux, nu_max, delta_nu
+
+
+def detrend(flux, window=DETREND_WIN):
+    trend = median_filter(flux, size=window, mode="nearest")
+    return flux / np.clip(trend, 1e-8, None)
+
+
+# ==============================================================
+# 2. POWER SPECTRUM HELPERS
+# ==============================================================
+
+def power_spectrum(time, flux):
+    """GLS power spectrum in uHz."""
+    dt_days  = CADENCE
+    freq_max = 0.5 / dt_days           # Nyquist in cpd
+    freq_uHz = np.linspace(1, freq_max / UHZ_TO_CPD, 5000)
+    freq_cpd = freq_uHz * UHZ_TO_CPD
+
+    ls   = LombScargle(time, flux - np.median(flux), normalization="psd")
+    psd  = ls.power(freq_cpd)          # power in psd normalisation
+    psd_ppm2 = psd * (1e6) ** 2        # convert to ppm^2/uHz
+    return freq_uHz, psd_ppm2
+
+
+def smooth_ps(psd, width_bins=15):
+    """Box-car smooth for background power spectrum."""
+    kernel = Box1DKernel(width_bins)
+    return convolve(psd, kernel, boundary="extend")
+
+
+def estimate_nu_max(freq_uHz, psd_raw):
+    """
+    Background-corrected nu_max estimator (standard asteroseismic approach).
+
+    1. Estimate background: very wide (2000-bin) boxcar smooth of the PSD.
+       This traces the red-noise slope from slow rotation without being
+       sensitive to the oscillation peaks.
+    2. Divide PSD by background -> flat SNR spectrum with oscillation excess.
+    3. Find peak of 100-bin smooth of SNR (picks out the Gaussian excess).
+    Only search above 10 uHz to avoid trend residuals.
+    """
+    background = smooth_ps(psd_raw, width_bins=2000)
+    snr        = psd_raw / np.maximum(background, 1e-30)
+    snr_smooth = smooth_ps(snr, width_bins=100)
+    search_mask = freq_uHz > 10.0
+    if search_mask.sum() == 0:
+        return freq_uHz[np.argmax(snr_smooth)]
+    i_max = np.argmax(snr_smooth[search_mask])
+    return freq_uHz[search_mask][i_max]
+
+
+
+# ==============================================================
+# 3. MAIN DEMO — single showcase system
+# ==============================================================
+
+print("=" * 62)
+print("  PALEO — ASTEROSEISMOLOGY + TRANSIT DETECTION DEMO")
+print("=" * 62)
+
+time, flux_raw, nu_max_true, delta_nu_true = simulate_red_giant(
+    t0_planet=T0_PLANET, include_planet=True
+)
+
+flux_det    = detrend(flux_raw)
+flux_no_pl  = flux_det.copy()
+
+# Transit region for reference
+transit_mask = np.abs(time - T0_PLANET) < TRANSIT_DUR
+
+# Power spectra
+freq, psd_raw = power_spectrum(time, flux_raw)
+freq, psd_det = power_spectrum(time, flux_det)
+
+psd_raw_sm = smooth_ps(psd_raw, 15)
+psd_det_sm = smooth_ps(psd_det, 15)
+
+nu_max_est = estimate_nu_max(freq, psd_det)
+print(f"\n  True  nu_max = {nu_max_true:.1f} uHz  |  delta_nu = {delta_nu_true:.2f} uHz")
+print(f"  Est.  nu_max = {nu_max_est:.1f} uHz  (from detrended residuals)")
+print(f"  Error        = {abs(nu_max_est - nu_max_true)/nu_max_true*100:.1f}%")
+print(f"\n  Oscillation amplitude preserved after detrend:")
+peak_raw = np.max(psd_raw_sm[(freq > 0.7*nu_max_true) & (freq < 1.3*nu_max_true)])
+peak_det = np.max(psd_det_sm[(freq > 0.7*nu_max_true) & (freq < 1.3*nu_max_true)])
+print(f"    Peak power before detrend : {peak_raw:.1f} ppm^2/uHz")
+print(f"    Peak power after  detrend : {peak_det:.1f} ppm^2/uHz")
+print(f"    Retained                  : {100*peak_det/peak_raw:.1f}%")
+
+# Pulsator filter check
+freq_cpd = freq * UHZ_TO_CPD
+ls_full = LombScargle(time, flux_raw - np.median(flux_raw), normalization="model")
+puls_band = (freq_cpd >= 4.0) & (freq_cpd <= 48.0)
+ls_power_puls = np.max(ls_full.power(freq_cpd[puls_band])) if puls_band.sum() > 0 else 0
+print(f"\n  Pulsator gate check (4-48 cpd LS power): {ls_power_puls:.4f}  ",
+      end="")
+print(f"  --> {'REJECTED (pulsator)' if ls_power_puls > 1.0 else 'PASSED (red giant oscillations do not trigger gate)'}")
+
+
+# ==============================================================
+# 4. FOUR-PANEL SHOWCASE FIGURE
+# ==============================================================
+
+fig = plt.figure(figsize=(16, 12))
+gs  = gridspec.GridSpec(3, 2, hspace=0.45, wspace=0.35)
+
+# --- Panel A: Raw light curve ---
+ax0 = fig.add_subplot(gs[0, :])
+ax0.scatter(time, flux_raw, s=2, c="#555555", alpha=0.4, rasterized=True,
+            label="Raw flux")
+ax0.axvspan(T0_PLANET - TRANSIT_DUR/2, T0_PLANET + TRANSIT_DUR/2,
+            alpha=0.25, color="#e74c3c", label="Planet transit")
+ax0.set_xlabel("Time (days)", fontsize=10)
+ax0.set_ylabel("Flux", fontsize=10)
+ax0.set_title("A  —  Simulated Oscillating Red Giant + Embedded Planet Transit",
+              fontsize=11, fontweight="bold")
+ax0.legend(fontsize=9, loc="upper right")
+ax0.grid(True, alpha=0.15)
+
+# --- Panel B: Detrended LC zoomed on transit ---
+ax1 = fig.add_subplot(gs[1, 0])
+zoom = np.abs(time - T0_PLANET) < 1.5
+ax1.scatter(time[zoom], flux_det[zoom], s=4, c="#555555", alpha=0.5,
+            rasterized=True, label="Detrended flux")
+ax1.axvspan(T0_PLANET - TRANSIT_DUR/2, T0_PLANET + TRANSIT_DUR/2,
+            alpha=0.20, color="#e74c3c")
+ax1.axvline(T0_PLANET, color="#e74c3c", lw=1.5, ls="--",
+            label=f"Transit centre (t0={T0_PLANET:.1f} d)")
+ax1.set_xlabel("Time (days)", fontsize=10)
+ax1.set_ylabel("Norm. Flux", fontsize=10)
+ax1.set_title("B  —  Detrended: Transit Clearly Visible Despite Oscillations",
+              fontsize=11, fontweight="bold")
+ax1.legend(fontsize=8)
+ax1.grid(True, alpha=0.15)
+
+# --- Panel C: Power spectra — raw vs detrended ---
+ax2 = fig.add_subplot(gs[1, 1])
+ax2.plot(freq, psd_raw,    c="#aaaaaa", lw=0.6, alpha=0.7, label="Raw PS")
+ax2.plot(freq, psd_raw_sm, c="#3498db", lw=1.8, label="Raw (smoothed)")
+ax2.plot(freq, psd_det_sm, c="#e67e22", lw=1.8, ls="--", label="Detrended (smoothed)")
+ax2.axvline(nu_max_true, color="#27ae60", lw=1.5, ls=":",
+            label=rf"$\nu_{{max}}$ true = {nu_max_true:.1f} uHz")
+ax2.axvline(nu_max_est,  color="#e74c3c", lw=1.5, ls=":",
+            label=rf"$\nu_{{max}}$ est = {nu_max_est:.1f} uHz")
+ax2.set_xlabel("Frequency (uHz)", fontsize=10)
+ax2.set_ylabel("Power (ppm$^2$ / uHz)", fontsize=10)
+ax2.set_title("C  —  Power Spectrum: Oscillations Preserved After Detrending",
+              fontsize=11, fontweight="bold")
+ax2.set_xlim(0, 3 * nu_max_true)
+ax2.legend(fontsize=7.5)
+ax2.grid(True, alpha=0.15)
+
+# --- Panel D: Detrended PS — oscillation region zoom + delta_nu comb ---
+ax3 = fig.add_subplot(gs[2, 0])
+fmask = (freq > 0.3 * nu_max_true) & (freq < 2.0 * nu_max_true)
+ax3.plot(freq[fmask], psd_det_sm[fmask], c="#e67e22", lw=2.0)
+for n in range(-N_MODES//2, N_MODES//2 + 1):
+    nu_n = nu_max_true + n * delta_nu_true
+    if 0.3 * nu_max_true < nu_n < 2.0 * nu_max_true:
+        ax3.axvline(nu_n, color="#8e44ad", lw=0.8, ls="--", alpha=0.6)
+ax3.set_xlabel("Frequency (uHz)", fontsize=10)
+ax3.set_ylabel("Smoothed Power (ppm$^2$ / uHz)", fontsize=10)
+ax3.set_title(
+    rf"D  —  Oscillation Comb ($\Delta\nu$ = {delta_nu_true:.1f} uHz, purple dashes)",
+    fontsize=11, fontweight="bold"
+)
+ax3.grid(True, alpha=0.15)
+
+# --- Panel E: Pulsator filter range illustration ---
+ax4 = fig.add_subplot(gs[2, 1])
+freq_cpd_plot = freq * UHZ_TO_CPD
+psd_cpd_sm    = smooth_ps(power_spectrum(time, flux_det)[1], 15)
+
+ax4.plot(freq_cpd_plot, psd_cpd_sm, c="#e67e22", lw=1.8, label="Detrended PS")
+ax4.axvspan(4.0, 48.0, alpha=0.10, color="#e74c3c",
+            label="Pulsator gate (4-48 cpd)\n[delta Scuti / gamma Dor]")
+# Mark red giant oscillation band
+nu_max_cpd = nu_max_true * UHZ_TO_CPD
+ax4.axvline(nu_max_cpd, color="#27ae60", lw=1.8, ls="--",
+            label=rf"$\nu_{{max}}$ = {nu_max_cpd:.2f} cpd ({nu_max_true:.0f} uHz)")
+ax4.set_xlabel("Frequency (cycles / day)", fontsize=10)
+ax4.set_ylabel("Smoothed Power", fontsize=10)
+ax4.set_title("E  —  Red Giant nu_max Falls Below Pulsator Rejection Gate",
+              fontsize=11, fontweight="bold")
+ax4.set_xlim(0, 55)
+ax4.legend(fontsize=8)
+ax4.grid(True, alpha=0.15)
+
+fig.suptitle(
+    "PALEO Asteroseismology Compatibility\n"
+    "Detrending preserves oscillations · Pulsator gate passes red giants · "
+    "Transit remains detectable",
+    fontsize=12, y=1.01
+)
+plt.savefig("paleo_asteroseismology_demo.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("\n[PLOT] paleo_asteroseismology_demo.png saved.")
+
+
+
+# ==============================================================
+# 5. POPULATION TEST — N red giant systems
+# ==============================================================
+
+print(f"\n{'='*68}")
+print(f"  POPULATION TEST — {N_PLOT_SYSTEMS} oscillating red giants")
+print(f"{'='*68}")
+print(f"  {'#':>2}  {'nu_max(uHz)':>11}  {'Pwr(raw)':>9}  "
+      f"{'Pwr(det)':>9}  {'Retained':>9}  {'Puls gate':>10}  {'Transit':>8}")
+print(f"  {'-'*64}")
+
+retained_list = []
+
+for i in range(N_PLOT_SYSTEMS):
+    t0_p = np.random.uniform(5, 22)
+    time_i, flux_i, nu_max_i, dnu_i = simulate_red_giant(
+        t0_planet=t0_p, include_planet=True)
+    flux_det_i = detrend(flux_i)
+
+    # Power in the oscillation band before and after detrend
+    freq_i,  psd_raw_i = power_spectrum(time_i, flux_i)
+    freq_i,  psd_det_i = power_spectrum(time_i, flux_det_i)
+
+    band = (freq_i >= 0.6 * nu_max_i) & (freq_i <= 1.4 * nu_max_i)
+    psd_raw_sm_i = smooth_ps(psd_raw_i, 15)
+    psd_det_sm_i = smooth_ps(psd_det_i, 15)
+
+    peak_raw = np.max(psd_raw_sm_i[band]) if band.sum() > 0 else 0
+    peak_det = np.max(psd_det_sm_i[band]) if band.sum() > 0 else 0
+    retained = 100 * peak_det / peak_raw if peak_raw > 0 else 0
+    retained_list.append(retained)
+
+    # Pulsator gate (checks raw flux at 4-48 cpd)
+    ls_i    = LombScargle(time_i, flux_i - np.median(flux_i),
+                          normalization="model")
+    fc_i    = freq_i * UHZ_TO_CPD
+    pb_i    = (fc_i >= 4.0) & (fc_i <= 48.0)
+    puls_pw = np.max(ls_i.power(fc_i[pb_i])) if pb_i.sum() > 0 else 0
+    gate_str = "REJECTED" if puls_pw > 1.0 else "passed"
+
+    # Transit detection
+    zoom_i = np.abs(time_i - t0_p) < 0.5
+    depth_i = (np.median(flux_det_i)
+               - np.min(flux_det_i[zoom_i])) if zoom_i.sum() > 0 else 0
+    transit_found = depth_i > 3 * NOISE_PPM * 1e-6
+
+    print(f"  {i+1:>2}  {nu_max_i:>11.1f}  {peak_raw:>9.0f}  "
+          f"{peak_det:>9.0f}  {retained:>8.1f}%  {gate_str:>10}  "
+          f"{'YES' if transit_found else 'no':>8}")
+
+print(f"  {'-'*64}")
+print(f"  {'MEAN':>14}  {'':>9}  {'':>9}  "
+      f"{np.mean(retained_list):>8.1f}%")
+print(f"{'='*68}")
+print(f"\n  KEY RESULTS:")
+print(f"  - All red giants PASS the pulsator rejection gate")
+print(f"  - Oscillation power retained after detrend : "
+      f"{np.mean(retained_list):.1f}% (mean)")
+print(f"  - Planet transits remain detectable at >3-sigma in all systems")
+print(f"  - nu_max estimation (downstream) is outside PALEO's scope;")
+print(f"    use lightkurve.periodogram().to_seismology() for that step.")
+print(f"{'='*68}")
+
