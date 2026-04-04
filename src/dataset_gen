@@ -1,0 +1,909 @@
+# ===========================
+# PALEOv3 — FULL DATASET BUILDER (CACHED FITS + manifest.csv)  ✅
+# Outputs:
+#   datasets/dataset_v1/{X.npy,Y.npy,M.npy,meta.csv,splits.json,config.json,
+#                        truth_events.csv, events_by_window.jsonl}
+#
+# IMPORTANT:
+#   ✅ Uses YOUR REAL STARLIST: keplerstellar_with_kepler_hostnames_ONLY.csv
+#      (NOT preliminary_kepler_star_list.csv)
+#   ✅ Transit labeling = EPHEMERIS-ONLY → CENTER HEATMAP (Gaussian)
+#   ✅ Flare labeling = your proven full-LC flare detector
+#   ✅ Input gridding = nearest neighbor within 0.5 cadence
+#   ✅ Normalization = median per window (optionally centered), NO SavGol
+#   ✅ Split by KIC (no leakage), flare-aware (always assigns all stars)
+#   ✅ Zip-safe cache unzip + rebuild paths locally
+#   ✅ Skip stars with 0 planets (no ephemerides)
+#   ✅ Optional: sanity plots (10 transit + 10 flare) at the end
+# ===========================
+
+import os, json, zipfile, shutil
+import numpy as np
+import pandas as pd
+import requests
+import lightkurve as lk
+
+# -----------------------------
+# FILES (REAL STARLIST)
+# -----------------------------
+STARLIST_PATH = "keplerstellar_with_kepler_hostnames_ONLY.csv"   # <-- REAL ONE
+CACHE_DIR     = "lightcurves_cache_fits"
+ZIP_PATH      = f"{CACHE_DIR}.zip"
+MANIFEST_PATH = os.path.join(CACHE_DIR, "manifest.csv")
+
+# -----------------------------
+# WINDOWING + GRID
+# -----------------------------
+CADENCE_MIN   = 29.4244
+DT_DAYS       = CADENCE_MIN / (60.0 * 24.0)
+
+WINDOW_DAYS   = 5.0
+OVERLAP_FRAC  = 0.50
+
+MAX_MISSING_FRAC = 0.10
+MAX_GAP_HOURS    = 6.0
+
+T = int(np.floor(WINDOW_DAYS / DT_DAYS))   # fixed length per window
+NN_TOL = 0.5 * DT_DAYS                     # nearest-neighbor tolerance (strict)
+
+CENTER_X_AROUND_ZERO = True  # x_norm = x/median - 1 if True
+
+# -----------------------------
+# TRANSIT LABELS: CENTER HEATMAP
+# -----------------------------
+CENTER_SIGMA_CAD   = 3.0
+CENTER_CUTOFF_SIG  = 5.0
+
+# duration clamp (your plan)
+DEFAULT_DUR_HRS = 3.0
+DUR_MIN_CAD     = 1
+DUR_MAX_HRS     = 10.0
+DUR_MAX_FRAC_P  = 0.05
+
+# -----------------------------
+# FLARE LABELS (YOUR PROVEN PARAMS)
+# -----------------------------
+FLARE_W_DAYS        = 2.5
+FLARE_K_AMP         = 5.0
+FLARE_K_RISE        = 3.0
+FLARE_K_DECAY       = 2.5
+FLARE_MIN_LEN       = 1
+FLARE_MAX_LEN_HRS   = 10.0
+FLARE_GAP_MULT      = 3.0
+FLARE_RISE_LOOKBACK = 4
+
+# -----------------------------
+# SPLIT
+# -----------------------------
+SPLIT_SEED = 42
+TRAIN_FRAC, VAL_FRAC, TEST_FRAC = 0.70, 0.15, 0.15
+K_FLARE_STARS_VAL  = 5
+K_FLARE_STARS_TEST = 5
+
+# -----------------------------
+# SANITY PLOTS (OPTIONAL)
+# -----------------------------
+MAKE_SANITY_PLOTS = False   # set True to show 10 transit + 10 flare plots after building
+N_TRANSIT_PLOTS   = 10
+N_FLARE_PLOTS     = 10
+DETREND_W_CAD      = 25     # plotting only
+ZOOM_HOURS         = 10.0   # plotting only
+PLOT_RNG_SEED      = 7
+
+# -----------------------------
+# OUTPUT
+# -----------------------------
+DATASET_DIR = "datasets/dataset_v1"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def hours_to_days(h): return h / 24.0
+
+def mad_sigma(x):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 5:
+        return np.nan
+    med = np.median(x)
+    mad = np.median(np.abs(x - med))
+    return 1.4826 * mad
+
+def count_events(flag_bool):
+    f = np.asarray(flag_bool, dtype=bool)
+    if f.size == 0:
+        return 0
+    return int(np.sum((f[1:] & ~f[:-1])) + (1 if f[0] else 0))
+
+def ensure_cache_present():
+    if not os.path.isdir(CACHE_DIR):
+        if os.path.exists(ZIP_PATH):
+            print(f"[INFO] {CACHE_DIR}/ not found. Unzipping {ZIP_PATH} ...")
+            with zipfile.ZipFile(ZIP_PATH, "r") as z:
+                z.extractall(".")
+            print("[INFO] Unzip complete.")
+        else:
+            raise FileNotFoundError(f"Missing {CACHE_DIR}/ and also missing {ZIP_PATH}")
+
+def fits_for_kepid(kepid: int) -> str:
+    return os.path.join(CACHE_DIR, f"kic_{kepid}_lc.fits")
+
+# -----------------------------
+# WINDOWING (your proven version)
+# -----------------------------
+def is_valid_window(t, f):
+    good = np.isfinite(t) & np.isfinite(f)
+    t_good = t[good]
+    if len(t_good) < 2:
+        return False
+    if np.max(np.diff(np.sort(t_good))) > hours_to_days(MAX_GAP_HOURS):
+        return False
+    expected = int(round(WINDOW_DAYS * 24 * 60 / CADENCE_MIN))
+    min_points = int(np.ceil((1.0 - MAX_MISSING_FRAC) * expected))
+    return len(t_good) >= min_points
+
+def window_lc(lc):
+    t = np.asarray(lc.time.value, float)
+    f = np.asarray(lc.flux.value, float)
+    good = np.isfinite(t) & np.isfinite(f)
+    t, f = t[good], f[good]
+    if t.size < 2:
+        return []
+
+    order = np.argsort(t)
+    t, f = t[order], f[order]
+
+    win  = WINDOW_DAYS
+    step = WINDOW_DAYS * (1 - OVERLAP_FRAC)
+
+    start0 = np.floor(t.min() / DT_DAYS) * DT_DAYS
+    windows = []
+    start = start0
+    tmax = t.max()
+
+    while start + win <= tmax:
+        end = start + win
+        i0 = np.searchsorted(t, start, side="left")
+        i1 = np.searchsorted(t, end,   side="left")
+        if i1 - i0 > 0:
+            tw, fw = t[i0:i1], f[i0:i1]
+            if is_valid_window(tw, fw):
+                windows.append((tw, fw, float(start), float(end)))
+        start += step
+
+    return windows
+
+# -----------------------------
+# TIME SYSTEM (same heuristic you used)
+# -----------------------------
+def lc_time_offset_days(lc):
+    tv = np.asarray(lc.time.value, dtype=float)
+    med = np.nanmedian(tv[np.isfinite(tv)]) if np.any(np.isfinite(tv)) else np.nan
+    if np.isfinite(med) and med < 1e5:
+        return 2454833.0  # BKJD offset
+    return 0.0
+
+def bjd_to_lc_time(lc, bjd):
+    return np.asarray(bjd, dtype=float) - lc_time_offset_days(lc)
+
+# -----------------------------
+# EPHEMERIDES (Exoplanet Archive TAP) — same pattern as before
+# -----------------------------
+_EPHEM_CACHE = {}
+
+def fetch_ephemerides_for_host(hostname):
+    hn = str(hostname).strip()
+    if hn == "" or hn.lower() == "nan":
+        return []
+    if hn in _EPHEM_CACHE:
+        return _EPHEM_CACHE[hn]
+
+    query = f"""
+        SELECT pl_name, pl_orbper, pl_tranmid, pl_trandur
+        FROM ps
+        WHERE hostname = '{hn.replace("'", "''")}'
+          AND pl_orbper IS NOT NULL
+          AND pl_tranmid IS NOT NULL
+          AND pl_trandur IS NOT NULL
+    """.strip().replace("\n", " ")
+
+    url = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
+    params = {"query": query, "format": "json"}
+
+    try:
+        rows = requests.get(url, params=params, timeout=30).json()
+    except Exception:
+        _EPHEM_CACHE[hn] = []
+        return []
+
+    planets_by_name = {}
+    for row in rows:
+        try:
+            name = str(row["pl_name"]).strip()
+            P = float(row["pl_orbper"])
+            t0 = float(row["pl_tranmid"])
+            dur_hours = float(row["pl_trandur"])
+            if not (np.isfinite(P) and P > 0 and np.isfinite(t0) and np.isfinite(dur_hours) and dur_hours > 0):
+                continue
+            dur_days = dur_hours / 24.0
+            if name not in planets_by_name:
+                planets_by_name[name] = {"name": name, "P_days": P, "t0_bjd": t0, "dur_days_cat": dur_days}
+        except Exception:
+            continue
+
+    planets = list(planets_by_name.values())
+    _EPHEM_CACHE[hn] = planets
+    return planets
+
+def clamp_duration_days(P_days, dur_days_cat):
+    if not (np.isfinite(dur_days_cat) and dur_days_cat > 0):
+        dur = DEFAULT_DUR_HRS / 24.0
+    else:
+        dur = float(dur_days_cat)
+
+    dur = max(dur, DUR_MIN_CAD * DT_DAYS)
+    dur = min(dur, DUR_MAX_HRS / 24.0)
+    if np.isfinite(P_days) and P_days > 0:
+        dur = min(dur, DUR_MAX_FRAC_P * P_days)
+    return float(dur)
+
+# -----------------------------
+# FIXED GRID: nearest-neighbor mapping within 0.5 cadence
+# -----------------------------
+def build_fixed_grid_nn(tw, fw, start):
+    t_grid = start + DT_DAYS * np.arange(T, dtype=float)
+
+    good = np.isfinite(tw) & np.isfinite(fw)
+    tw2 = np.asarray(tw[good], dtype=float)
+    fw2 = np.asarray(fw[good], dtype=float)
+
+    X = np.zeros(T, dtype=float)
+    M = np.zeros(T, dtype=np.uint8)
+
+    if tw2.size < 2:
+        return t_grid, X, M
+
+    order = np.argsort(tw2)
+    tws = tw2[order]
+    fws = fw2[order]
+
+    idx = np.searchsorted(tws, t_grid, side="left")
+    left = np.clip(idx - 1, 0, tws.size - 1)
+    right = np.clip(idx, 0, tws.size - 1)
+
+    d_left = np.abs(t_grid - tws[left])
+    d_right = np.abs(t_grid - tws[right])
+
+    choose_right = d_right < d_left
+    nearest = np.where(choose_right, right, left)
+    d_near = np.minimum(d_left, d_right)
+
+    ok = d_near < NN_TOL
+    M[ok] = 1
+    X[ok] = fws[nearest[ok]]
+
+    return t_grid, X, M
+
+def normalize_window_median(x_raw, M):
+    x = np.asarray(x_raw, dtype=float).copy()
+    m = (np.asarray(M, dtype=np.uint8) > 0)
+
+    if m.sum() < 10:
+        out = np.zeros_like(x, dtype=np.float32)
+        out[m] = np.nan_to_num(x[m], nan=0.0)
+        return out.astype(np.float32)
+
+    baseline = np.median(x[m])
+    if not np.isfinite(baseline) or baseline == 0:
+        baseline = 1.0
+
+    x_norm = x / baseline
+    if CENTER_X_AROUND_ZERO:
+        x_norm = x_norm - 1.0
+
+    x_norm[~m] = 0.0
+    x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=0.0, neginf=0.0)
+    return x_norm.astype(np.float32)
+
+# -----------------------------
+# TRUTH: enumerate all transit centers across the star time span
+# -----------------------------
+def enumerate_transit_centers_for_star(lc, planets, t_min, t_max):
+    truth = []
+    if len(planets) == 0:
+        return truth
+
+    for p in planets:
+        P = float(p["P_days"])
+        if not (np.isfinite(P) and P > 0):
+            continue
+        t0_lc = float(bjd_to_lc_time(lc, p["t0_bjd"]))
+        dur_eff = clamp_duration_days(P, p.get("dur_days_cat", np.nan))
+
+        n0 = int(np.floor((t_min - t0_lc) / P))
+        n1 = int(np.ceil((t_max - t0_lc) / P))
+
+        for n in range(n0, n1 + 1):
+            t_c = t0_lc + n * P
+            if t_min <= t_c <= t_max:
+                truth.append({
+                    "pl_name": p["name"],
+                    "P_days": float(P),
+                    "t_c": float(t_c),
+                    "dur_eff_days": float(dur_eff),
+                })
+
+    truth.sort(key=lambda r: r["t_c"])
+    return truth
+
+def truth_events_in_window(t0, t1, truth_list):
+    out = []
+    for ev in truth_list:
+        if t0 <= ev["t_c"] <= t1:
+            i_c = int(np.round((ev["t_c"] - t0) / DT_DAYS))
+            half = int(np.ceil((0.5 * ev["dur_eff_days"]) / DT_DAYS))
+            out.append({
+                "pl_name": ev["pl_name"],
+                "t_c": float(ev["t_c"]),
+                "P_days": float(ev["P_days"]),
+                "dur_eff_days": float(ev["dur_eff_days"]),
+                "i_c": int(i_c),
+                "i0": int(i_c - half),
+                "i1": int(i_c + half),
+            })
+    return out
+
+def center_heatmap(events):
+    Y = np.zeros(T, dtype=np.float32)
+    if len(events) == 0:
+        return Y
+
+    sigma = float(CENTER_SIGMA_CAD)
+    rad = int(np.ceil(CENTER_CUTOFF_SIG * sigma))
+
+    for ev in events:
+        i_c = int(ev["i_c"])
+        if not (0 <= i_c < T):
+            continue
+        lo = max(0, i_c - rad)
+        hi = min(T - 1, i_c + rad)
+        ii = np.arange(lo, hi + 1, dtype=float)
+        bump = np.exp(-0.5 * ((ii - i_c) / sigma) ** 2).astype(np.float32)
+        Y[lo:hi+1] = np.maximum(Y[lo:hi+1], bump)
+
+    return Y
+
+# -----------------------------
+# FLARES (your proven detector)
+# -----------------------------
+def flare_flags_full_lc(
+    t, f, cadence_days,
+    W_DAYS=FLARE_W_DAYS,
+    K_AMP=FLARE_K_AMP,
+    K_RISE=FLARE_K_RISE,
+    K_DECAY=FLARE_K_DECAY,
+    MIN_LEN=FLARE_MIN_LEN,
+    MAX_LEN_HOURS=FLARE_MAX_LEN_HRS,
+    GAP_MULT=FLARE_GAP_MULT,
+    RISE_LOOKBACK=FLARE_RISE_LOOKBACK
+):
+    t = np.asarray(t, float)
+    f = np.asarray(f, float)
+
+    W = max(7, int(round(W_DAYS / cadence_days)))
+    if W % 2 == 0:
+        W += 1
+
+    baseline = pd.Series(f).rolling(window=W, center=True, min_periods=max(5, W // 3)).median().to_numpy()
+    resid = f - baseline
+
+    dt = np.diff(t)
+    gap_ok = np.ones_like(t, dtype=bool)
+    gap_ok[1:] = dt < (GAP_MULT * cadence_days)
+    gap_ok[:-1] &= dt < (GAP_MULT * cadence_days)
+
+    sigma_res = mad_sigma(resid[gap_ok])
+    if not (np.isfinite(sigma_res) and sigma_res > 0):
+        return np.zeros_like(t, dtype=bool)
+
+    dr2 = np.full_like(resid, np.nan)
+    dr2[2:] = resid[2:] - resid[:-2]
+    sigma_dr = mad_sigma(dr2[gap_ok])
+    if not (np.isfinite(sigma_dr) and sigma_dr > 0):
+        return np.zeros_like(t, dtype=bool)
+
+    amp_thr   = K_AMP   * sigma_res
+    rise_thr  = K_RISE  * sigma_dr
+    decay_thr = K_DECAY * sigma_res
+
+    hot = gap_ok & np.isfinite(resid) & (resid > amp_thr)
+    idx = np.where(hot)[0]
+
+    flare_flag = np.zeros_like(t, dtype=bool)
+    if idx.size == 0:
+        return flare_flag
+
+    MAX_LEN = int(round((MAX_LEN_HOURS / 24.0) / cadence_days))
+    MAX_LEN = max(MAX_LEN, MIN_LEN)
+
+    splits = np.where(np.diff(idx) > 1)[0]
+    starts = np.r_[0, splits + 1]
+    ends   = np.r_[splits, idx.size - 1]
+
+    for a, b in zip(starts, ends):
+        seg = idx[a:b+1]
+        L = len(seg)
+        if L < MIN_LEN or L > MAX_LEN:
+            continue
+
+        pk = int(seg[np.argmax(resid[seg])])
+        if pk < 2:
+            continue
+
+        lo = max(2, pk - int(RISE_LOOKBACK))
+        hi = pk + 1
+        if hi <= lo:
+            continue
+
+        dr_slice = dr2[lo:hi]
+        dr_slice = dr_slice[np.isfinite(dr_slice)]
+        if dr_slice.size == 0:
+            continue
+        if not (np.max(dr_slice) > rise_thr):
+            continue
+
+        j2 = min(len(resid) - 1, pk + 4)
+        post = resid[pk+1:j2+1]
+        if post.size == 0 or not np.all(np.isfinite(post)):
+            continue
+        if not (np.nanmax(resid[pk] - post) > decay_thr):
+            continue
+
+        lo2 = max(0, seg[0] - 1)
+        hi2 = min(len(resid), seg[-1] + 2)
+        flare_flag[lo2:hi2] = True
+
+    return flare_flag
+
+def detect_flares_full_lc(lc):
+    t = np.asarray(lc.time.value, dtype=float)
+    f = np.asarray(lc.flux.value, dtype=float)
+    good = np.isfinite(t) & np.isfinite(f)
+    t, f = t[good], f[good]
+    if t.size < 10:
+        return t, np.zeros_like(t, dtype=bool)
+    order = np.argsort(t)
+    t, f = t[order], f[order]
+    dts = np.diff(t)
+    cadence_est = np.nanmedian(dts[np.isfinite(dts)]) if dts.size else DT_DAYS
+    if not (np.isfinite(cadence_est) and cadence_est > 0):
+        cadence_est = DT_DAYS
+    flare_flag = flare_flags_full_lc(t, f, cadence_days=cadence_est)
+    return t, flare_flag
+
+def map_flags_to_grid_nn(t_full, flag_full, t_grid):
+    out = np.zeros(T, dtype=np.float32)
+    t_full = np.asarray(t_full, float)
+    flag_full = np.asarray(flag_full, bool)
+    if t_full.size == 0:
+        return out
+
+    order = np.argsort(t_full)
+    ts = t_full[order]
+    fs = flag_full[order]
+
+    idx = np.searchsorted(ts, t_grid, side="left")
+    left = np.clip(idx - 1, 0, ts.size - 1)
+    right = np.clip(idx, 0, ts.size - 1)
+
+    d_left = np.abs(t_grid - ts[left])
+    d_right = np.abs(t_grid - ts[right])
+
+    choose_right = d_right < d_left
+    nearest = np.where(choose_right, right, left)
+    d_near = np.minimum(d_left, d_right)
+
+    ok = d_near < NN_TOL
+    out[ok] = fs[nearest[ok]].astype(np.float32)
+    return out
+
+# ============================================================
+# BUILD DATASET
+# ============================================================
+
+ensure_cache_present()
+if not os.path.exists(MANIFEST_PATH):
+    raise FileNotFoundError(f"Missing manifest: {MANIFEST_PATH}")
+if not os.path.exists(STARLIST_PATH):
+    raise FileNotFoundError(f"Missing starlist: {STARLIST_PATH}")
+
+# Read manifest
+m = pd.read_csv(MANIFEST_PATH)
+m = m[m["status"].isin(["ok", "cached"])].copy()
+
+# Read real starlist
+stars = pd.read_csv(STARLIST_PATH, on_bad_lines="skip")
+if "kepid" not in stars.columns:
+    raise KeyError("STARLIST must contain 'kepid' column.")
+if "hostname" not in stars.columns:
+    stars["hostname"] = ""
+
+stars = stars[["kepid", "hostname"]].copy()
+
+# Merge and prefer starlist hostname (your old behavior)
+m = m.merge(stars, on="kepid", how="left", suffixes=("", "_starlist"))
+m["hostname"] = m["hostname"].fillna("").astype(str)
+if "hostname_starlist" in m.columns:
+    hs = m["hostname_starlist"].fillna("").astype(str)
+    m["hostname"] = np.where(hs.str.strip().ne(""), hs, m["hostname"])
+
+print("[INFO] Cached stars usable before planet filter:", len(m))
+print("[INFO] T =", T, "| DT_DAYS =", DT_DAYS, "| NN_TOL (days) =", NN_TOL)
+
+X_list, Y_list, M_list = [], [], []
+kepid_list, host_list, tstart_list = [], [], []
+
+truth_rows = []
+events_by_window_lines = []
+
+flare_events_per_star = {}
+flare_windows_per_star = {}
+num_planets_per_star = {}
+planet_names_per_star = {}
+
+skipped_zero_planets = 0
+stars_with_windows = 0
+
+for _, row in m.iterrows():
+    kepid = int(row["kepid"])
+    hostname = str(row.get("hostname", "")).strip()
+    target = f"KIC {kepid}"
+
+    try:
+        planets = fetch_ephemerides_for_host(hostname)
+        if len(planets) == 0:
+            skipped_zero_planets += 1
+            print(f"[SKIP] {target} | planets=0 (no ephemerides)")
+            continue
+
+        fits_path = fits_for_kepid(kepid)
+        if not (os.path.exists(fits_path) and os.path.getsize(fits_path) > 0):
+            raise FileNotFoundError(f"Missing/empty FITS: {fits_path}")
+
+        lc = lk.read(fits_path)
+
+        # full LC time range (finite only)
+        t_all = np.asarray(lc.time.value, float)
+        f_all = np.asarray(lc.flux.value, float)
+        good = np.isfinite(t_all) & np.isfinite(f_all)
+        t_all, f_all = t_all[good], f_all[good]
+        if t_all.size < 10:
+            print(f"[SKIP] {target} | too few finite points")
+            continue
+        order = np.argsort(t_all)
+        t_all, f_all = t_all[order], f_all[order]
+        t_min, t_max = float(t_all.min()), float(t_all.max())
+
+        # truth list (global)
+        truth_list = enumerate_transit_centers_for_star(lc, planets, t_min, t_max)
+
+        # flare flags over full LC
+        t_full, flare_flag_full = detect_flares_full_lc(lc)
+        flare_events_per_star[kepid] = count_events(flare_flag_full)
+
+        num_planets_per_star[kepid] = len(planets)
+        planet_names_per_star[kepid] = [p["name"] for p in planets]
+
+        # windows
+        windows = window_lc(lc)
+        flare_w_count = 0
+        win_added = 0
+
+        for (tw, fw, start, end) in windows:
+            t_grid, x_raw, M0 = build_fixed_grid_nn(tw, fw, start)
+
+            x = normalize_window_median(x_raw, M0)[:, None]  # (T,1)
+            Mw = M0.astype(np.float32)[:, None]              # (T,1)
+
+            evs = truth_events_in_window(start, start + WINDOW_DAYS, truth_list)
+            y_center = center_heatmap(evs)                   # (T,)
+
+            y_flare = map_flags_to_grid_nn(t_full, flare_flag_full, t_grid)
+            y_flare = y_flare * (M0 > 0).astype(np.float32)
+
+            if (y_flare * (M0 > 0)).sum() > 0:
+                flare_w_count += 1
+
+            Yw = np.stack([y_center, y_flare], axis=1).astype(np.float32)  # (T,2)
+
+            X_list.append(x.astype(np.float32))
+            Y_list.append(Yw)
+            M_list.append(Mw)
+
+            kepid_list.append(kepid)
+            host_list.append(hostname)
+            tstart_list.append(float(start))
+
+            events_by_window_lines.append(json.dumps({
+                "kepid": kepid,
+                "hostname": hostname,
+                "t_start": float(start),
+                "t_end": float(start + WINDOW_DAYS),
+                "events": evs
+            }))
+
+            win_added += 1
+
+        flare_windows_per_star[kepid] = flare_w_count
+
+        for ev in truth_list:
+            truth_rows.append({
+                "kepid": kepid,
+                "hostname": hostname,
+                "pl_name": ev["pl_name"],
+                "P_days": ev["P_days"],
+                "t_c": ev["t_c"],
+                "dur_eff_days": ev["dur_eff_days"],
+            })
+
+        if win_added > 0:
+            stars_with_windows += 1
+
+        print(f"[OK] {target} | windows={win_added} | planets={len(planets)} | flare_events={flare_events_per_star[kepid]} | flare_windows={flare_w_count}")
+
+    except Exception as e:
+        print(f"[SKIP] {target} failed: {e}")
+
+if len(X_list) == 0:
+    raise RuntimeError("No windows produced (after skipping planets==0 stars).")
+
+X = np.stack(X_list, axis=0).astype(np.float32)   # (N,T,1)
+Y = np.stack(Y_list, axis=0).astype(np.float32)   # (N,T,2)
+M = np.stack(M_list, axis=0).astype(np.float32)   # (N,T,1)
+
+kepid_per_window = np.asarray(kepid_list, dtype=np.int64)
+host_per_window  = np.asarray(host_list, dtype=object)
+t_starts         = np.asarray(tstart_list, dtype=np.float64)
+
+print("\n[SUMMARY]")
+print("Stars skipped (planets==0):", int(skipped_zero_planets))
+print("Stars with >=1 window:", int(np.unique(kepid_per_window).size))
+print("Total windows N:", int(X.shape[0]), "| T:", int(X.shape[1]))
+
+# ============================================================
+# SPLIT BY STAR (flare-aware, no leakage)
+# ============================================================
+unique_stars = np.unique(kepid_per_window)
+rng = np.random.default_rng(SPLIT_SEED)
+
+flare_any_window = (Y[:, :, 1] * M[:, :, 0]).sum(axis=1) > 0
+flare_stars = np.unique(kepid_per_window[flare_any_window])
+nonflare_stars = np.setdiff1d(unique_stars, flare_stars, assume_unique=False)
+
+flare_stars = flare_stars.copy(); rng.shuffle(flare_stars)
+nonflare_stars = nonflare_stars.copy(); rng.shuffle(nonflare_stars)
+
+n_stars = unique_stars.size
+n_train = int(round(TRAIN_FRAC * n_stars))
+n_val   = int(round(VAL_FRAC   * n_stars))
+n_test  = n_stars - n_train - n_val
+
+k_val  = int(min(K_FLARE_STARS_VAL,  len(flare_stars), n_val))
+k_test = int(min(K_FLARE_STARS_TEST, max(0, len(flare_stars) - k_val), n_test))
+
+val_flare  = flare_stars[:k_val]
+test_flare = flare_stars[k_val:k_val + k_test]
+remain_flare = flare_stars[k_val + k_test:]
+
+def take(arr, k):
+    k = max(0, int(k))
+    return arr[:k], arr[k:]
+
+val_need  = n_val  - len(val_flare)
+test_need = n_test - len(test_flare)
+
+val_fill_nf, nonflare_stars = take(nonflare_stars, val_need)
+val_need -= len(val_fill_nf)
+val_fill_fl, remain_flare = take(remain_flare, val_need)
+
+test_fill_nf, nonflare_stars = take(nonflare_stars, test_need)
+test_need -= len(test_fill_nf)
+test_fill_fl, remain_flare = take(remain_flare, test_need)
+
+val_stars   = np.concatenate([val_flare,  val_fill_nf,  val_fill_fl]).astype(np.int64)
+test_stars  = np.concatenate([test_flare, test_fill_nf, test_fill_fl]).astype(np.int64)
+train_stars = np.concatenate([remain_flare, nonflare_stars]).astype(np.int64)
+
+assert len(val_stars) == n_val
+assert len(test_stars) == n_test
+assert len(train_stars) == n_train
+
+all_assigned = np.concatenate([train_stars, val_stars, test_stars])
+assert np.unique(all_assigned).size == unique_stars.size, "Not all stars assigned exactly once."
+
+is_train = np.isin(kepid_per_window, train_stars)
+is_val   = np.isin(kepid_per_window, val_stars)
+is_test  = np.isin(kepid_per_window, test_stars)
+
+train_idx = np.where(is_train)[0]
+val_idx   = np.where(is_val)[0]
+test_idx  = np.where(is_test)[0]
+
+def _flare_windows(idxs):
+    idxs = np.asarray(idxs, dtype=int)
+    return int(np.sum(((Y[idxs, :, 1] * M[idxs, :, 0]).sum(axis=1) > 0)))
+
+print("\n=== SPLIT SUMMARY (BY STAR) ===")
+print("Total stars:", int(n_stars))
+print("Flare-active stars:", int(len(flare_stars)), "| Nonflare stars:", int(len(np.setdiff1d(unique_stars, flare_stars))))
+print("Target star counts: train=", n_train, "val=", n_val, "test=", n_test)
+print("Actual star counts: train=", len(train_stars), "val=", len(val_stars), "test=", len(test_stars))
+print("Flare windows | train:", _flare_windows(train_idx),
+      "val:", _flare_windows(val_idx),
+      "test:", _flare_windows(test_idx))
+
+splits = {
+    "train_stars": train_stars.tolist(),
+    "val_stars": val_stars.tolist(),
+    "test_stars": test_stars.tolist(),
+    "train_idx": train_idx.tolist(),
+    "val_idx": val_idx.tolist(),
+    "test_idx": test_idx.tolist(),
+}
+
+# ============================================================
+# SAVE
+# ============================================================
+os.makedirs(DATASET_DIR, exist_ok=True)
+
+np.save(os.path.join(DATASET_DIR, "X.npy"), X)
+np.save(os.path.join(DATASET_DIR, "Y.npy"), Y)
+np.save(os.path.join(DATASET_DIR, "M.npy"), M)
+
+meta = pd.DataFrame({
+    "window_index": np.arange(X.shape[0], dtype=int),
+    "kepid": kepid_per_window,
+    "hostname": host_per_window.astype(str),
+    "t_start": t_starts,
+    "t_end": t_starts + WINDOW_DAYS,
+})
+meta.to_csv(os.path.join(DATASET_DIR, "meta.csv"), index=False)
+
+with open(os.path.join(DATASET_DIR, "splits.json"), "w") as f:
+    json.dump(splits, f, indent=2)
+
+truth_df = pd.DataFrame(truth_rows)
+truth_df.to_csv(os.path.join(DATASET_DIR, "truth_events.csv"), index=False)
+
+with open(os.path.join(DATASET_DIR, "events_by_window.jsonl"), "w") as f:
+    for line in events_by_window_lines:
+        f.write(line + "\n")
+
+config = {
+    "STARLIST_PATH": STARLIST_PATH,
+    "CACHE_DIR": CACHE_DIR,
+    "MANIFEST_PATH": MANIFEST_PATH,
+    "CADENCE_MIN": CADENCE_MIN,
+    "DT_DAYS": DT_DAYS,
+    "WINDOW_DAYS": WINDOW_DAYS,
+    "OVERLAP_FRAC": OVERLAP_FRAC,
+    "T": int(T),
+    "NN_TOL_DAYS": float(NN_TOL),
+    "MAX_MISSING_FRAC": MAX_MISSING_FRAC,
+    "MAX_GAP_HOURS": MAX_GAP_HOURS,
+    "CENTER_SIGMA_CAD": float(CENTER_SIGMA_CAD),
+    "CENTER_CUTOFF_SIG": float(CENTER_CUTOFF_SIG),
+    "CENTER_X_AROUND_ZERO": bool(CENTER_X_AROUND_ZERO),
+    "DUR_DEFAULT_HRS": float(DEFAULT_DUR_HRS),
+    "DUR_MIN_CAD": int(DUR_MIN_CAD),
+    "DUR_MAX_HRS": float(DUR_MAX_HRS),
+    "DUR_MAX_FRAC_P": float(DUR_MAX_FRAC_P),
+    "TRANSIT_LABEL_MODE": "ephemeris_center_heatmap",
+    "FLARE_PARAMS": {
+        "FLARE_W_DAYS": FLARE_W_DAYS,
+        "FLARE_K_AMP": FLARE_K_AMP,
+        "FLARE_K_RISE": FLARE_K_RISE,
+        "FLARE_K_DECAY": FLARE_K_DECAY,
+        "FLARE_MIN_LEN": FLARE_MIN_LEN,
+        "FLARE_MAX_LEN_HRS": FLARE_MAX_LEN_HRS,
+        "FLARE_GAP_MULT": FLARE_GAP_MULT,
+        "FLARE_RISE_LOOKBACK": FLARE_RISE_LOOKBACK,
+    },
+    "SPLIT_SEED": SPLIT_SEED,
+    "TRAIN_FRAC": TRAIN_FRAC,
+    "VAL_FRAC": VAL_FRAC,
+    "TEST_FRAC": TEST_FRAC,
+    "K_FLARE_STARS_VAL": K_FLARE_STARS_VAL,
+    "K_FLARE_STARS_TEST": K_FLARE_STARS_TEST,
+    "SKIP_STARS_WITH_ZERO_PLANETS": True,
+}
+with open(os.path.join(DATASET_DIR, "config.json"), "w") as f:
+    json.dump(config, f, indent=2)
+
+valid_total = float(np.sum(M))
+center_rate = float(np.sum(Y[:, :, 0:1] * M) / (valid_total + 1e-12))
+flare_rate  = float(np.sum(Y[:, :, 1:2] * M) / (valid_total + 1e-12))
+
+windows_with_center = int(np.sum((np.sum(Y[:, :, 0] * M[:, :, 0], axis=1) > 0)))
+windows_with_flare  = int(np.sum((np.sum(Y[:, :, 1] * M[:, :, 0], axis=1) > 0)))
+
+print("\n==== DATASET BUILD COMPLETE ====")
+print(f"Saved dataset folder: {DATASET_DIR}")
+print(f"N={int(X.shape[0])} | T={int(X.shape[1])}")
+print(f"Avg valid fraction: {valid_total / (X.shape[0] * T):.4f}")
+print(f"Center-heatmap labeled rate: {center_rate:.6e}")
+print(f"Flare labeled cadence rate:  {flare_rate:.6e}")
+print(f"Windows with any center labels: {windows_with_center}")
+print(f"Windows with any flare labels:  {windows_with_flare}")
+print(f"Saved truth list: {os.path.join(DATASET_DIR, 'truth_events.csv')}")
+print(f"Saved per-window events: {os.path.join(DATASET_DIR, 'events_by_window.jsonl')}")
+
+# Optional: zip + download in Colab
+try:
+    from google.colab import files  # type: ignore
+    zip_out = shutil.make_archive("dataset_v1", "zip", root_dir="datasets", base_dir="dataset_v1")
+    print("\n[COLAB] Zipped:", zip_out)
+    files.download(zip_out)
+except Exception:
+    pass
+
+# ============================================================
+# OPTIONAL SANITY PLOTS (10 transit + 10 flare)
+# ============================================================
+if MAKE_SANITY_PLOTS:
+    import matplotlib.pyplot as plt
+
+    rngp = np.random.default_rng(PLOT_RNG_SEED)
+
+    def detrend_for_plot_only(x, w=DETREND_W_CAD):
+        s = pd.Series(np.asarray(x, float))
+        tr = s.rolling(int(w), center=True, min_periods=max(3, int(w)//2)).median().to_numpy()
+        tr = np.nan_to_num(tr, nan=0.0)
+        return (np.asarray(x, float) - tr).astype(np.float32)
+
+    transit_idx = np.where((Y[:, :, 0] * M[:, :, 0]).sum(axis=1) > 0)[0]
+    flare_idx   = np.where((Y[:, :, 1] * M[:, :, 0]).sum(axis=1) > 0)[0]
+
+    def pick(idxs, n):
+        if idxs.size == 0:
+            return []
+        if idxs.size <= n:
+            return idxs.tolist()
+        return rngp.choice(idxs, size=n, replace=False).tolist()
+
+    pick_t = pick(transit_idx, N_TRANSIT_PLOTS)
+    pick_f = pick(flare_idx,   N_FLARE_PLOTS)
+
+    def plot_one(i, title):
+        x = X[i, :, 0]
+        m = M[i, :, 0]
+        yC = Y[i, :, 0]
+        yF = Y[i, :, 1]
+        t0 = t_starts[i]
+        xh = (np.arange(T) * DT_DAYS) * 24.0
+
+        xd = detrend_for_plot_only(x)
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(xh, x, lw=1, label="x (median norm, centered)")
+        plt.plot(xh, xd, lw=1, label="x_detrended (plot-only)")
+        amp = max(float(np.nanmax(np.abs(xd))), 1e-4)
+        plt.plot(xh, -0.8*amp*yC, lw=1, label="center heatmap (scaled)")
+        plt.plot(xh,  0.8*amp*yF, lw=1, label="flare flag (scaled)")
+        plt.scatter(xh[m < 0.5], np.full(int(np.sum(m < 0.5)), -amp), s=8, label="missing (M=0)")
+        plt.axhline(0.0, lw=1)
+        plt.title(f"{title} | win={i} | KIC={kepid_per_window[i]} | t0={t0:.3f}")
+        plt.xlabel("Hours from window start")
+        plt.ylabel("Flux")
+        plt.legend(loc="best")
+        plt.tight_layout()
+        plt.show()
+
+    print("\n--- SANITY: TRANSIT WINDOWS ---")
+    for i in pick_t:
+        plot_one(i, "TRANSIT")
+
+    print("\n--- SANITY: FLARE WINDOWS ---")
+    for i in pick_f:
+        plot_one(i, "FLARE")
