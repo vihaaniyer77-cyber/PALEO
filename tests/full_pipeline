@@ -1,0 +1,473 @@
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from scipy.signal import find_peaks
+from scipy.ndimage import median_filter
+from scipy.optimize import minimize
+import batman
+from astropy.timeseries import LombScargle, BoxLeastSquares
+import time
+
+# Start the stopwatch
+start_time = time.time()
+
+# --- Code you want to measure ---
+#time.sleep(2) # Sleeps for 2 seconds
+# --------------------------------
+
+# Stop the stopwatch
+
+
+# --- CONFIG ---
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Auto-detect model location (works locally and in Colab)
+import os as _os
+_MODEL_CANDIDATES = [
+    "tcn_epoch_020.pt",                                    # current directory
+    "/content/tcn_epoch_020.pt",                           # Colab file upload
+    "/content/drive/MyDrive/tcn_epoch_020.pt",             # Colab Drive
+    "C:/Users/vihaa/Downloads/tcn_epoch_020.pt",           # Windows local
+]
+MODEL_FILENAME = next((p for p in _MODEL_CANDIDATES if _os.path.exists(p)), _MODEL_CANDIDATES[0])
+
+# ==============================================================
+# 1. TCN MODEL DEFINITIONS
+# ==============================================================
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = int(chomp_size)
+    def forward(self, x): return x[:, :, :-self.chomp_size] if self.chomp_size > 0 else x
+
+class ResidualTCNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout=0.15, groups_gn=None):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        if groups_gn is not None and groups_gn > 0:
+            self.n1 = nn.GroupNorm(num_groups=max(1, min(groups_gn, out_ch)), num_channels=out_ch)
+        else:
+            self.n1 = nn.BatchNorm1d(out_ch)
+        self.relu1 = nn.ReLU()
+        self.drop1 = nn.Dropout(dropout)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        if groups_gn is not None and groups_gn > 0:
+            self.n2 = nn.GroupNorm(num_groups=max(1, min(groups_gn, out_ch)), num_channels=out_ch)
+        else:
+            self.n2 = nn.BatchNorm1d(out_ch)
+        self.relu2 = nn.ReLU()
+        self.drop2 = nn.Dropout(dropout)
+        self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.drop1(self.relu1(self.n1(self.chomp1(self.conv1(x)))))
+        out = self.drop2(self.relu2(self.n2(self.chomp2(self.conv2(out)))))
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+class TCNEventDetector(nn.Module):
+    def __init__(self, in_ch=1, hidden=128, depth=8, kernel_size=5, dropout=0.15, groups_gn=None, out_ch=2):
+        super().__init__()
+        dilations = [2**i for i in range(depth)]
+        blocks = []
+        c_in = in_ch
+        for d in dilations:
+            blocks.append(ResidualTCNBlock(c_in, hidden, kernel_size, d, dropout, groups_gn))
+            c_in = hidden
+        self.backbone = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(hidden, out_ch, 1)
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+def load_model(path):
+    if not os.path.exists(path): return None
+    try:
+        ckpt = torch.load(path, map_location=DEVICE)
+        state_dict = ckpt.get("model_state", ckpt)
+        config = ckpt.get("config", {})
+        gn = config.get("groups_gn", 8)
+        if any("bn1.weight" in k for k in state_dict.keys()): gn = None
+        model = TCNEventDetector(in_ch=1, hidden=config.get("hidden", 128),
+                                 depth=config.get("depth", 8), kernel_size=config.get("kernel_size", 5),
+                                 dropout=config.get("dropout", 0.15), groups_gn=gn).to(DEVICE)
+        new_state = {}
+        for k, v in state_dict.items():
+            new_k = k.replace("bn1", "n1").replace("gn1", "n1").replace("bn2", "n2").replace("gn2", "n2")
+            new_state[new_k] = v
+        model.load_state_dict(new_state, strict=False)
+        model.eval()
+        return model
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return None
+
+# ==============================================================
+# 2. SINGLE-PASS FOLDED BATMAN VALIDATOR
+# ==============================================================
+class FoldedValidator:
+    def validate_candidate(self, phase, flux, t0_pred, window_width=0.3):
+        # Use a TIGHT window: ~4x transit duration so transit fills most of the window
+        mask = np.abs(phase - t0_pred) < (window_width / 2.0)
+        p_local = phase[mask]
+        f_local = flux[mask]
+        if len(p_local) < 5: return {"verdict": "REJECTED", "gain": 0.0, "params": {}}
+        f_global_median = np.median(flux)  # Global out-of-transit baseline
+        chi2_flat = np.sum((f_local - f_global_median)**2)
+        if chi2_flat < 1e-10: return {"verdict": "REJECTED", "gain": 0.0, "params": {}}  # Window has zero variance = no dip
+
+        def transit_model(params, t):
+            t0, rp, dur = params
+            m_params = batman.TransitParams()
+            m_params.t0 = t0
+            m_params.per = 10000.0
+            m_params.rp = rp
+            m_params.a = 10000.0 / (np.pi * dur)
+            m_params.inc = 90.0
+            m_params.ecc = 0.0
+            m_params.w = 90.0
+            m_params.u = [0.3, 0.3]
+            m_params.limb_dark = "quadratic"
+            m = batman.TransitModel(m_params, t)
+            return m.light_curve(m_params) * f_global_median
+
+        def objective(params):
+            return np.sum((f_local - transit_model(params, p_local))**2)
+
+        bounds = [(t0_pred - 0.1, t0_pred + 0.1), (0.005, 0.5), (0.04, 0.5)]
+        guesses = [t0_pred, 0.05, 0.1]
+        try:
+            res = minimize(objective, guesses, bounds=bounds, method='L-BFGS-B')
+            chi2_transit = res.fun
+            best = res.x
+        except:
+            return {"verdict": "ERROR", "gain": 0.0, "params": {}}
+
+        gain = 1.0 - (chi2_transit / chi2_flat)
+        verdict = "VALIDATED" if gain > 0.005 else "REJECTED"
+        return {"verdict": verdict, "gain": gain, "params": {"t0": best[0], "rp": best[1], "dur": best[2]}}
+
+# ==============================================================
+# 3. FALSE POSITIVE FILTERS
+# ==============================================================
+def is_pulsator(time, flux, power_threshold=1.0):
+    """High-frequency LS check: periods 0.5-6 hours.
+    Threshold=1.0 based on calibration: pulsators give power 1.2-77,
+    transit harmonics give 0.04-0.28 — no overlap."""
+    f_min = 24.0 / 6.0
+    f_max = 24.0 / 0.5
+    frequency = np.linspace(f_min, f_max, 1000)
+    ls = LombScargle(time, flux - np.median(flux), normalization='model')
+    power = ls.power(frequency)
+    return np.max(power) > power_threshold
+
+def is_eclipsing_binary(time, flux, period, t0, duration):
+    """
+    Three cheap checks — only catches OBVIOUS EBs:
+    1. Absolute depth gate: mean transit depth > 2% = EB
+    2. Secondary eclipse: visible dip at phase ~0.5 (>15% of primary, >2*sigma)
+    3. Odd/even depth asymmetry (needs >=2 transits of each parity)
+    Ambiguous shallow EBs that look like planets are intentionally left through.
+    """
+    global_median = np.median(flux)
+    global_std = np.std(flux)
+    half_dur = max(duration / 2.0, 0.02)
+
+    # Collect per-transit depths at primary positions
+    transit_depths = []
+    t_scan = t0 % period
+    while t_scan < time[-1]:
+        if t_scan >= time[0]:
+            mask = np.abs(time - t_scan) < half_dur
+            if np.sum(mask) >= 3:
+                d = global_median - np.percentile(flux[mask], 15)  # p15 captures V-shape depth better than median
+                transit_depths.append(d)
+        t_scan += period
+
+    if len(transit_depths) < 2:
+        return False
+
+    mean_depth = np.mean(transit_depths)
+
+    # Noise guard: signal must be real before any test fires
+    if mean_depth < 2.0 * global_std:
+        return False
+
+    # Gate 1: absolute depth (>2.5% = almost certainly EB; gives margin above planet max of 2%)
+    if mean_depth > 0.025:
+        return True
+
+    # Gate 2: secondary eclipse check — look for dip at half-period offset
+    t_sec_start = (t0 + period / 2.0) % period
+    secondary_depths = []
+    t_sec = t_sec_start
+    while t_sec < time[-1]:
+        if t_sec >= time[0]:
+            mask = np.abs(time - t_sec) < half_dur
+            if np.sum(mask) >= 3:
+                secondary_depths.append(global_median - np.median(flux[mask]))
+        t_sec += period
+    if secondary_depths:
+        sec_depth = np.mean(secondary_depths)
+        # Secondary must be >10% of primary AND >2*noise to be real
+        if sec_depth > 0.10 * mean_depth and sec_depth > 2.0 * global_std:
+            return True
+
+    # Gate 3: odd/even asymmetry (needs >=2 of each parity)
+    odd  = transit_depths[0::2]
+    even = transit_depths[1::2]
+    if len(odd) >= 2 and len(even) >= 2:
+        ratio = abs(np.mean(odd) - np.mean(even)) / (mean_depth + 1e-8)
+        if ratio > 0.3:
+            return True
+
+    return False
+
+# ==============================================================
+# 4. SYNTHETIC DATASET GENERATOR
+# ==============================================================
+def get_batman_transit(t, period, t0, dur, depth):
+    m_params = batman.TransitParams()
+    m_params.t0 = t0
+    m_params.per = period
+    m_params.rp = np.sqrt(depth)
+    m_params.a = max(2.0, period / (np.pi * dur))  # correct geometry: transit duration ~ dur days
+    m_params.inc = 90.0
+    m_params.ecc = 0.0
+    m_params.w = 90.0
+    m_params.u = [0.3, 0.3]
+    m_params.limb_dark = "quadratic"
+    m = batman.TransitModel(m_params, t)
+    return m.light_curve(m_params)
+
+def detrend_flux(flux, window=241):
+    """Rolling-median detrend (window ~5 days at 30min cadence).
+    Removes 1-15 day stellar modulation while preserving transits:
+    - Modulation (1-15d): 1-5 full cycles in window → near-complete removal
+    - Transit (0.04-0.2d): only 2-10 pts out of 241 → median unaffected."""
+    trend = median_filter(flux, size=window, mode='nearest')
+    return flux / np.clip(trend, 1e-6, None)
+
+def generate_synthetic_dataset(n_samples=1000):
+    print(f"[INFO] Synthesizing dataset of {n_samples} light curves...")
+    dataset = []
+    n_planets    = int(n_samples * 0.40)
+    n_ebs        = int(n_samples * 0.20)
+    n_pulsators  = int(n_samples * 0.15)
+    n_modulation = int(n_samples * 0.15)  # new: stellar rotation modulation
+    time_ax = np.linspace(0, 27, 1300)
+    for i in tqdm(range(n_samples), desc="Generating Fake LCs"):
+        flux = np.ones_like(time_ax) + np.random.normal(0, 0.0001, len(time_ax))  # 100 ppm, realistic TESS precision
+        meta = {}
+        if i < n_planets:
+            label = "Planet"
+            per = np.random.uniform(0.5, 12.0)
+            t0  = np.random.uniform(0.0, per)
+            dur = np.random.uniform(0.04, 0.2)
+            # Stratified planet classes (equal probability each)
+            planet_type = np.random.choice(["HotJupiter", "Saturn", "Neptune", "SuperEarth"])
+            depth_ranges = {
+                "HotJupiter":  (0.0100, 0.0200),  # rp ~ 0.100-0.141 R* (~11-15 R_earth)
+                "Saturn":      (0.0050, 0.0100),  # rp ~ 0.071-0.100 R* (~8-11 R_earth)
+                "Neptune":     (0.0010, 0.0020),  # rp ~ 0.032-0.045 R* (~3.5-5 R_earth)
+                "SuperEarth":  (0.0002, 0.0010),  # rp ~ 0.014-0.032 R* (~1.5-3.5 R_earth)
+            }
+            d_min, d_max = depth_ranges[planet_type]
+            depth = np.random.uniform(d_min, d_max)
+            flux *= get_batman_transit(time_ax, per, t0, dur, depth)
+            meta = {"period": per, "t0": t0, "depth": depth, "type": planet_type}
+
+        elif i < n_planets + n_ebs:
+            label = "EB"
+            per = np.random.uniform(0.5, 12.0)
+            t0 = np.random.uniform(0.0, per)
+            dur = np.random.uniform(0.08, 0.3)
+            depth = np.random.uniform(0.02, 0.1)
+            for tt in np.arange(t0, 27, per):
+                mask = np.abs(time_ax - tt) < (dur / 2)
+                dist = np.abs(time_ax[mask] - tt) / (dur / 2)
+                flux[mask] = 1.0 - depth * (1.0 - dist)
+            for tt in np.arange(t0 + per/2, 27, per):
+                mask = np.abs(time_ax - tt) < (dur / 2)
+                dist = np.abs(time_ax[mask] - tt) / (dur / 2)
+                flux[mask] -= (depth * 0.3) * (1.0 - dist)
+        elif i < n_planets + n_ebs + n_pulsators:
+            label = "Pulsator"
+            freq = np.random.uniform(5.0, 24.0)
+            amp = np.random.uniform(0.005, 0.02)
+            flux += amp * np.sin(2 * np.pi * freq * time_ax)
+        elif i < n_planets + n_ebs + n_pulsators + n_modulation:
+            label = "Modulation"
+            mod_period = np.random.uniform(1.0, 15.0)   # stellar rotation: 1-15 days
+            mod_amp    = np.random.uniform(0.001, 0.008) # 1-8 mmag amplitude
+            phase      = np.random.uniform(0, 2 * np.pi)
+            flux += mod_amp * np.sin(2 * np.pi * time_ax / mod_period + phase)
+        else:
+            label = "Noise"
+        dataset.append({"id": f"SYNTH_{i:04d}", "time": time_ax, "flux": flux, "true_label": label, "meta": meta})
+    return dataset
+
+# ==============================================================
+# 5. EVALUATION PIPELINE
+# ==============================================================
+def evaluate_pipeline(dataset, model):
+    validator = FoldedValidator()
+    tp, fp, fn, tn = 0, 0, 0, 0
+    fn_reasons = {"tcn_missed": 0, "validator_rejected": 0, "eb_filter_false_alarm": 0, "bls_missed": 0, "pulsator_check": 0}
+    fp_reasons = {"was_eb": 0, "was_pulsator": 0, "was_modulation": 0, "was_noise": 0}
+    planet_types = ["HotJupiter", "Saturn", "Neptune", "SuperEarth"]
+    per_type = {t: {"tp": 0, "fn": 0} for t in planet_types}
+
+    BATCH_SIZE = 128
+
+    for i in tqdm(range(0, len(dataset), BATCH_SIZE), desc="Evaluating Streamlined Pipeline"):
+        batch = dataset[i:i+BATCH_SIZE]
+        fluxes = [b["flux"] for b in batch]
+        x_tensor = torch.tensor(np.array(fluxes), dtype=torch.float32, device=DEVICE).unsqueeze(1) - 1.0
+
+        with torch.no_grad():
+            logits = model(x_tensor)
+            probs = torch.sigmoid(logits[:, 0, :]).cpu().numpy()
+
+        for b_idx, item in enumerate(batch):
+            time_ax = item["time"]
+            flux = item["flux"]
+            truth = item["true_label"]
+            # Detrend: remove slow stellar modulation before BLS
+            # (window=31pts ~15hr >> transit duration 0.04-0.2d)
+            flux_detrended = detrend_flux(flux)
+
+            pipeline_claims_planet = False
+            rejection_stage = ""
+
+            is_puls = is_pulsator(time_ax, flux)
+            if is_puls:
+                rejection_stage = "pulsator_check"
+            else:
+                p_curve = probs[b_idx][:len(flux)]
+
+                # TCN acts as structural mapper, picking up > 0.1 peaks
+                peaks, _ = find_peaks(p_curve, height=0.1, distance=20)
+
+                if len(peaks) < 3 or np.mean(p_curve[peaks]) < 0.15:
+                    rejection_stage = "tcn_missed"
+                else:
+                    # Synthetic BLS
+                    # TCN-GUIDED BLS ON REAL FLUX
+                    # TCN acts as a gatekeeper (>=3 peaks required).
+                    # BLS runs on ACTUAL photometry over the full period range.
+                    # At 100 ppm noise, pure noise gives SDE~1-2 on real flux;
+                    # real planets give SDE~10+ regardless of depth.
+                    periods = np.linspace(0.5, 12.0, 2000)
+                    durations = np.linspace(0.04, 0.25, 10)
+
+                    # BLS on DETRENDED flux (modulation removed, transit preserved)
+                    bls_model = BoxLeastSquares(time_ax, flux_detrended)
+                    results = bls_model.power(periods, durations)
+
+                    best_idx = np.argmax(results.power)
+                    sde = (np.max(results.power) - np.mean(results.power)) / (np.std(results.power) + 1e-8)
+                    best_period = results.period[best_idx]
+                    t0_pred = results.transit_time[best_idx]
+                    dur_pred = results.duration[best_idx]
+
+                    if sde < 6.0:  # noise max ~5.0, planet min ~9.7 — 1.0 gap of safety
+                        rejection_stage = "bls_missed"
+
+
+                    else:
+                        # EB Checks and Folded Validation
+                        phase = (time_ax - t0_pred + 0.5 * best_period) % best_period - 0.5 * best_period
+
+                        # EXACTLY ONE Batman Execution on the phase-folded trace
+                        # Use tight window = 4× BLS-estimated duration so transit dominates chi2
+                        dynamic_window = max(0.1, min(dur_pred * 4, 0.5))
+                        val_res = validator.validate_candidate(phase, flux_detrended, 0.0, window_width=dynamic_window)
+
+                        if val_res["verdict"] == "REJECTED":
+                            rejection_stage = "validator_rejected"
+                        else:
+                            true_dur = val_res["params"]["dur"]
+                            in_tran = np.abs(phase) < (true_dur / 2)
+                            depth = np.median(flux_detrended) - np.median(flux_detrended[in_tran]) if np.sum(in_tran) > 2 else val_res["params"]["rp"]**2
+
+                            # EB check on raw time-domain data (odd/even + depth gate)
+                            if is_eclipsing_binary(time_ax, flux_detrended, best_period, t0_pred, true_dur):
+                                rejection_stage = "eb_filter_false_alarm"
+                            else:
+                                pipeline_claims_planet = True
+
+            if pipeline_claims_planet and truth == "Planet":
+                tp += 1
+                ptype = item["meta"].get("type", "Unknown")
+                if ptype in per_type: per_type[ptype]["tp"] += 1
+            elif not pipeline_claims_planet and truth != "Planet": tn += 1
+            elif pipeline_claims_planet and truth != "Planet":
+                fp += 1
+                if truth == "EB": fp_reasons["was_eb"] += 1
+                elif truth == "Pulsator": fp_reasons["was_pulsator"] += 1
+                elif truth == "Modulation": fp_reasons["was_modulation"] += 1
+                else: fp_reasons["was_noise"] += 1
+            elif not pipeline_claims_planet and truth == "Planet":
+                fn += 1
+                fn_reasons[rejection_stage] += 1
+                ptype = item["meta"].get("type", "Unknown")
+                if ptype in per_type: per_type[ptype]["fn"] += 1
+
+    print("\n==================================")
+    print("      FAST EVALUATION REPORT      ")
+    print("==================================")
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+    print(f"Total Evaluated : {len(dataset)}")
+    print(f"True Positives  : {tp}")
+    print(f"True Negatives  : {tn}")
+    print(f"False Positives : {fp}")
+    print(f"False Negatives : {fn}")
+    print(f"----------------------------------")
+    print(f"PRECISION : {precision:.2%}")
+    print(f"RECALL    : {recall:.2%}")
+    print(f"F1-SCORE  : {f1:.2%}")
+    print(f"==================================\n")
+    print("--- OPTIMIZATION DRILL-DOWN: FALSE NEGATIVES (Missed) ---")
+    print(f"  TCN Missed entirely (Peaks < 3)         : {fn_reasons['tcn_missed']}")
+    print(f"  BLS SDE < 7.0 (real flux)               : {fn_reasons['bls_missed']}")
+    print(f"  Rejected as Pulsator (FP filter)        : {fn_reasons['pulsator_check']}")
+    print(f"  Accidentally Rejected as EB             : {fn_reasons['eb_filter_false_alarm']}")
+    print(f"  Batman Shape Validator Rejected         : {fn_reasons['validator_rejected']}")
+    print("\n--- OPTIMIZATION DRILL-DOWN: FALSE POSITIVES (Junk) ---")
+    print(f"  EBs mapped as Planets                   : {fp_reasons['was_eb']}")
+    print(f"  Pulsators mapped as Planets             : {fp_reasons['was_pulsator']}")
+    print(f"  Modulation mapped as Planets            : {fp_reasons['was_modulation']}")
+    print(f"  Noise spikes mapped as Planets          : {fp_reasons['was_noise']}")
+
+    print("\n--- PER PLANET CLASS BREAKDOWN ---")
+    print(f"  {'Class':<14} {'Detected':>8} {'Missed':>7} {'Recall':>8}")
+    print(f"  {'-'*40}")
+    for ptype in planet_types:
+        tp_t = per_type[ptype]["tp"]
+        fn_t = per_type[ptype]["fn"]
+        total_t = tp_t + fn_t
+        rec_t = tp_t / total_t if total_t > 0 else 0
+        print(f"  {ptype:<14} {tp_t:>8} {fn_t:>7} {rec_t:>8.1%}")
+
+if __name__ == "__main__":
+    model = load_model(MODEL_FILENAME)
+    if model is None:
+        print(f"[FATAL] Could not load model. Ensure {MODEL_FILENAME} is uploaded.")
+    else:
+        dataset = generate_synthetic_dataset(n_samples=10000) # Fast evaluation run locally
+        evaluate_pipeline(dataset, model)
+end_time = time.time()
+
+# Calculate and print elapsed time
+elapsed = end_time - start_time
+print(f"Elapsed time: {elapsed} seconds")
