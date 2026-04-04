@@ -117,7 +117,7 @@ Requires `tcn_epoch_020.pt` model weights in the working directory (or `/content
 
 ## Next Steps
 
-- [ ] Full TESS sector survey (Sectors 1–26)
+- [ ] Full TESS sector survey
 - [ ] Multi-sector stacking for Super-Earth sensitivity
 - [ ] Circumbinary system searches
 
