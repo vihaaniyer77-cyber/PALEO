@@ -1,0 +1,625 @@
+# train_paleo_v4_discovery.py (Updated: logs 0.1 threshold too)
+# ============================================================
+# UPDATED CONFIG:
+#   - POS_WEIGHT_POWER = 1.0 (Inverse Freq Weighting)
+#   - pos_weight CAP = 100.0 (Strong Penalty for Rare events)
+#   - W_FLARE = 0.50 (Force Feature Separation)
+#   - LOGGING: Every epoch now prints Recall@0.1 (Discovery) AND Recall@0.5 (Standard)
+# ============================================================
+
+import os, json, zipfile, time, math
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from contextlib import nullcontext
+
+# -----------------------------
+# Repro
+# -----------------------------
+SEED = 0
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+# -----------------------------
+# A100 speed knobs
+# -----------------------------
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = (device.type == "cuda")
+autocast_ctx = (lambda: torch.cuda.amp.autocast(dtype=torch.float16)) if USE_AMP else (lambda: nullcontext())
+scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+
+print("Device:", device, "| USE_AMP:", USE_AMP, flush=True)
+
+# ============================================================
+# ROBUST: ENSURE DATASET PRESENT (UNZIP + AUTO-DETECT FOLDER)
+# ============================================================
+DATASET_ZIP = "dataset_v1.zip"
+PREFERRED_DIR = "datasets/dataset_v1"
+
+def _looks_like_dataset_dir(d):
+    return (
+        os.path.isdir(d)
+        and os.path.exists(os.path.join(d, "X.npy"))
+        and os.path.exists(os.path.join(d, "Y.npy"))
+        and os.path.exists(os.path.join(d, "M.npy"))
+        and os.path.exists(os.path.join(d, "splits.json"))
+    )
+
+def ensure_dataset_present():
+    if _looks_like_dataset_dir(PREFERRED_DIR):
+        return PREFERRED_DIR
+
+    if os.path.exists(DATASET_ZIP):
+        print(f"[INFO] {PREFERRED_DIR}/ not found. Unzipping {DATASET_ZIP} ...", flush=True)
+        with zipfile.ZipFile(DATASET_ZIP, "r") as z:
+            z.extractall(".")
+        print("[INFO] Unzip complete.", flush=True)
+
+    candidates = ["datasets/dataset_v1", "dataset_v1", "datasets", "."]
+    for c in candidates:
+        if _looks_like_dataset_dir(c):
+            print("[INFO] Using DATASET_DIR:", c, flush=True)
+            return c
+
+    for root, dirs, files in os.walk(".", topdown=True):
+        rel = os.path.relpath(root, ".")
+        if rel.count(os.sep) > 3:
+            dirs[:] = []
+            continue
+        if _looks_like_dataset_dir(root):
+            print("[INFO] Using DATASET_DIR:", root, flush=True)
+            return root
+
+    raise FileNotFoundError("Unzipped, but couldn't locate dataset folder with X/Y/M/splits.json.")
+
+DATASET_DIR = ensure_dataset_present()
+X_PATH      = os.path.join(DATASET_DIR, "X.npy")
+Y_PATH      = os.path.join(DATASET_DIR, "Y.npy")
+M_PATH      = os.path.join(DATASET_DIR, "M.npy")
+SPLITS_PATH = os.path.join(DATASET_DIR, "splits.json")
+
+X = np.load(X_PATH, mmap_mode="r")
+Y = np.load(Y_PATH, mmap_mode="r")
+M = np.load(M_PATH, mmap_mode="r")
+
+with open(SPLITS_PATH, "r") as f:
+    splits = json.load(f)
+
+train_idx = np.asarray(splits["train_idx"], dtype=np.int64)
+val_idx   = np.asarray(splits["val_idx"], dtype=np.int64)
+
+T = int(X.shape[1])
+print("Loaded:", X.shape, Y.shape, M.shape, "| T =", T, flush=True)
+
+rng = np.random.default_rng(SEED)
+train_idx = rng.permutation(train_idx)
+val_idx   = rng.permutation(val_idx)
+
+# ============================================================
+# MODEL (capacity boost)
+# ============================================================
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size: int):
+        super().__init__()
+        self.chomp_size = int(chomp_size)
+
+    def forward(self, x):
+        if self.chomp_size <= 0:
+            return x
+        return x[:, :, :-self.chomp_size]
+
+class ResidualTCNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, kernel_size, dilation, dropout=0.15, groups_gn=8):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.gn1 = nn.GroupNorm(num_groups=max(1, min(groups_gn, out_ch)), num_channels=out_ch)
+        self.drop1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.gn2 = nn.GroupNorm(num_groups=max(1, min(groups_gn, out_ch)), num_channels=out_ch)
+        self.drop2 = nn.Dropout(dropout)
+
+        self.downsample = None
+        if in_ch != out_ch:
+            self.downsample = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+
+    def forward(self, x):
+        y = self.conv1(x)
+        y = self.chomp1(y)
+        y = self.gn1(y)
+        y = F.gelu(y)
+        y = self.drop1(y)
+
+        y = self.conv2(y)
+        y = self.chomp2(y)
+        y = self.gn2(y)
+        y = F.gelu(y)
+        y = self.drop2(y)
+
+        res = x if self.downsample is None else self.downsample(x)
+        return y + res
+
+class TCNEventDetector(nn.Module):
+    def __init__(self, in_ch=1, hidden=128, depth=8, kernel_size=5, dropout=0.15, groups_gn=8, out_ch=2):
+        super().__init__()
+        dilations = [2 ** i for i in range(depth)]
+        blocks = []
+        ch_in = in_ch
+        for d in dilations:
+            blocks.append(ResidualTCNBlock(ch_in, hidden, kernel_size, d, dropout, groups_gn))
+            ch_in = hidden
+        self.backbone = nn.Sequential(*blocks)
+        self.head = nn.Conv1d(hidden, out_ch, kernel_size=1)
+        nn.init.zeros_(self.head.bias)
+        nn.init.kaiming_normal_(self.head.weight, nonlinearity="linear")
+
+    def forward(self, x):
+        return self.head(self.backbone(x))
+
+# instantiate
+HIDDEN = 128
+DEPTH  = 8
+KERNEL = 5
+DROPOUT = 0.15
+
+model = TCNEventDetector(in_ch=1, hidden=HIDDEN, depth=DEPTH, kernel_size=KERNEL, dropout=DROPOUT, groups_gn=8, out_ch=2).to(device)
+
+# ============================================================
+# DATALOADER
+# ============================================================
+class WindowDataset(Dataset):
+    def __init__(self, X, Y, M, indices):
+        self.X = X
+        self.Y = Y
+        self.M = M
+        self.idx = np.asarray(indices, dtype=np.int64)
+
+    def __len__(self):
+        return self.idx.size
+
+    def __getitem__(self, i):
+        j = int(self.idx[i])
+        x = torch.from_numpy(np.asarray(self.X[j])).float()  # (T,1)
+        y = torch.from_numpy(np.asarray(self.Y[j])).float()  # (T,2)
+        m = torch.from_numpy(np.asarray(self.M[j])).float()  # (T,1)
+        x = x.permute(1, 0).contiguous()  # (1,T)
+        y = y.permute(1, 0).contiguous()  # (2,T)
+        m = m.permute(1, 0).contiguous()  # (1,T)
+        return x, y, m
+
+# A100 knobs
+BATCH_SIZE       = 128
+GRAD_ACCUM_STEPS = 1
+NUM_WORKERS      = 8 if os.name != "nt" else 0
+PIN_MEMORY       = (device.type == "cuda")
+PERSISTENT       = (NUM_WORKERS > 0)
+
+train_loader = DataLoader(
+    WindowDataset(X, Y, M, train_idx),
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=NUM_WORKERS,
+    pin_memory=PIN_MEMORY,
+    persistent_workers=PERSISTENT,
+    prefetch_factor=2 if PERSISTENT else None,
+)
+val_loader = DataLoader(
+    WindowDataset(X, Y, M, val_idx),
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=NUM_WORKERS,
+    pin_memory=PIN_MEMORY,
+    persistent_workers=PERSISTENT,
+    prefetch_factor=2 if PERSISTENT else None,
+)
+
+print("train windows:", len(train_idx), "val windows:", len(val_idx), flush=True)
+print("batches/epoch:", len(train_loader), "| batch_size:", BATCH_SIZE, "| grad_accum:", GRAD_ACCUM_STEPS, flush=True)
+
+# ============================================================
+# LOSS (Transit=BCEWithLogits on soft heatmap, Flare=BCEWithLogits) + masking
+# ============================================================
+def to_BCT(z, C, T, name="tensor"):
+    if z.dim() != 3:
+        raise RuntimeError(f"{name} must be 3D, got {z.dim()}D shape={tuple(z.shape)}")
+    if z.shape[1] == C and z.shape[2] == T:
+        return z
+    if z.shape[1] == T and z.shape[2] == C:
+        return z.permute(0, 2, 1).contiguous()
+    raise RuntimeError(f"{name} wrong shape: expected (B,{C},{T}) or (B,{T},{C}), got {tuple(z.shape)}")
+
+@torch.no_grad()
+def compute_pos_weight_tempered(loader, power=0.75, pw_min=1.0, cap=50.0, max_batches=250):
+    # Works for soft heatmap too (pos mass is fractional)
+    pos = torch.zeros(2, device=device)
+    tot = torch.zeros(2, device=device)
+    for b, (_, yb, mb) in enumerate(loader, start=1):
+        yb = yb.to(device, non_blocking=True)
+        mb = mb.to(device, non_blocking=True)
+        yb = to_BCT(yb, 2, T, "yb")
+        mb = to_BCT(mb, 1, T, "mb")
+        mb2 = mb.expand(-1, 2, -1)
+        tot += mb2.sum(dim=(0, 2))
+        pos += (yb * mb2).sum(dim=(0, 2))
+        if b >= max_batches:
+            break
+    neg = tot - pos
+    pos = torch.clamp(pos, min=1.0)
+    raw = neg / pos
+    tempered = torch.pow(torch.clamp(raw, min=1.0), power)
+    pw = torch.clamp(tempered, min=pw_min, max=cap)
+    return pw
+
+# --- UPDATED: power=1.0, cap=100.0 ---
+pos_weight = compute_pos_weight_tempered(train_loader, power=1.0, pw_min=1.0, cap=100.0, max_batches=250)
+print("pos_weight [transit, flare] =", pos_weight.detach().cpu().numpy(), flush=True)
+
+# head weights (transit primary, flare secondary but present)
+W_TRANSIT = 1.0
+W_FLARE   = 0.50
+
+def masked_multihead_loss(logits, y, m):
+    logits = to_BCT(logits, 2, T, "logits")
+    y      = to_BCT(y,      2, T, "y")
+    m      = to_BCT(m,      1, T, "m")
+    m0 = m[:, 0:1, :]  # (B,1,T)
+
+    # Transit head (0): BCEWithLogits on soft labels, with soft-friendly upweight
+    log_tr = logits[:, 0:1, :]
+    y_tr   = y[:, 0:1, :].clamp(0.0, 1.0)
+    bce_tr_el = F.binary_cross_entropy_with_logits(log_tr, y_tr, reduction="none")
+
+    # emphasize meaningful heatmap mass (not every tiny tail)
+    pw_tr = pos_weight[0].clamp(min=1.0)
+    bce_tr_el = bce_tr_el * (1.0 + (pw_tr - 1.0) * (y_tr > 0.10).float())
+    loss_tr = (bce_tr_el * m0).sum() / torch.clamp(m0.sum(), min=1.0)
+
+    # Flare head (1): BCEWithLogits with pos_weight
+    log_fl = logits[:, 1:2, :]
+    y_fl   = y[:, 1:2, :].clamp(0.0, 1.0)
+    bce_fl_el = F.binary_cross_entropy_with_logits(
+        log_fl, y_fl, reduction="none", pos_weight=pos_weight[1].view(1, 1, 1)
+    )
+    loss_fl = (bce_fl_el * m0).sum() / torch.clamp(m0.sum(), min=1.0)
+
+    total = W_TRANSIT * loss_tr + W_FLARE * loss_fl
+    return total, loss_tr, loss_fl
+
+# ============================================================
+# VAL EVENT METRIC (TOPK cap + min-sep prevents gaming)
+# ============================================================
+@torch.no_grad()
+def find_local_maxima_1d(p, thr=0.5):
+    p = p.detach().float()
+    if p.numel() < 3:
+        return torch.empty(0, dtype=torch.long, device=p.device)
+    mid = p[1:-1]
+    lm = (mid >= p[:-2]) & (mid >= p[2:]) & (mid >= thr)
+    return torch.where(lm)[0] + 1
+
+@torch.no_grad()
+def topk_keep(p, peak_idx, k=2):
+    if peak_idx.numel() == 0:
+        return []
+    scores = p[peak_idx]
+    order = torch.argsort(scores, descending=True)
+    keep = peak_idx[order[:k]].detach().cpu().tolist()
+    keep.sort()
+    return keep
+
+@torch.no_grad()
+def enforce_min_sep(peaks, min_sep=8):
+    kept = []
+    for i in peaks:
+        if all(abs(i - k) >= min_sep for k in kept):
+            kept.append(i)
+    kept.sort()
+    return kept
+
+@torch.no_grad()
+def match_events(pred_idx, true_idx, tol=6):
+    pred = list(pred_idx)
+    true = list(true_idx)
+    used = set()
+    tp = 0
+    for t in true:
+        hit = None
+        for j, p in enumerate(pred):
+            if j in used:
+                continue
+            if abs(p - t) <= tol:
+                hit = j
+                break
+        if hit is not None:
+            tp += 1
+            used.add(hit)
+    fp = len(pred) - len(used)
+    fn = len(true) - tp
+    return tp, fp, fn
+
+@torch.no_grad()
+def eval_event_metrics(loader, max_batches=None, pred_thr=0.5, true_thr=0.5, min_sep=8, tol=6, topk=2):
+    model.eval()
+    tp_tot = fp_tot = fn_tot = 0
+    peaks = 0
+    win = 0
+    loss_tot = 0.0
+    nloss = 0
+
+    for b, (xb, yb, mb) in enumerate(loader, start=1):
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        mb = mb.to(device, non_blocking=True)
+
+        xb = torch.nan_to_num(xb, nan=0.0)
+
+        with autocast_ctx():
+            logits = model(xb)
+            loss, _, _ = masked_multihead_loss(logits, yb, mb)
+
+        loss_tot += float(loss.item()); nloss += 1
+
+        logits = to_BCT(logits, 2, T, "logits")
+        yb     = to_BCT(yb,     2, T, "yb")
+        mbT    = to_BCT(mb,     1, T, "mb")[:, 0, :]  # (B,T)
+
+        p_tr = torch.sigmoid(logits[:, 0, :]) * mbT
+        y_tr = yb[:, 0, :] * mbT
+
+        B = p_tr.shape[0]
+        for i in range(B):
+            true_peaks_t = find_local_maxima_1d(y_tr[i], thr=true_thr)
+            pred_peaks_t = find_local_maxima_1d(p_tr[i], thr=pred_thr)
+
+            pred_list = topk_keep(p_tr[i], pred_peaks_t, k=topk)
+            pred_list = enforce_min_sep(pred_list, min_sep=min_sep)
+
+            true_list = true_peaks_t.detach().cpu().tolist()
+            true_list = enforce_min_sep(true_list, min_sep=min_sep)
+
+            tpi, fpi, fni = match_events(pred_list, true_list, tol=tol)
+            tp_tot += tpi; fp_tot += fpi; fn_tot += fni
+            peaks += len(pred_list)
+            win += 1
+
+        if (max_batches is not None) and (b >= int(max_batches)):
+            break
+
+    recall = tp_tot / max(1, tp_tot + fn_tot)
+    prec   = tp_tot / max(1, tp_tot + fp_tot)
+    return {
+        "event_recall": float(recall),
+        "event_precision": float(prec),
+        "peaks_per_window": float(peaks / max(1, win)),
+        "val_loss": float(loss_tot / max(1, nloss)),
+        "tp": int(tp_tot), "fp": int(fp_tot), "fn": int(fn_tot),
+        "windows_eval": int(win),
+        "val_cfg": {"pred_thr": pred_thr, "true_thr": true_thr, "min_sep": min_sep, "tol": tol, "topk": topk},
+    }
+
+# ============================================================
+# OPTIM + SCHEDULE
+# ============================================================
+LR = 3e-4
+WEIGHT_DECAY = 1e-2
+EPOCHS = 80
+GRAD_CLIP = 1.0
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+WARMUP_EPOCHS = 3
+def lr_mult(epoch):
+    if epoch <= WARMUP_EPOCHS:
+        return epoch / max(1.0, float(WARMUP_EPOCHS))
+    t = (epoch - WARMUP_EPOCHS) / max(1.0, float(EPOCHS - WARMUP_EPOCHS))
+    return 0.5 * (1.0 + math.cos(math.pi * t))
+
+# ============================================================
+# CHECKPOINTING
+# ============================================================
+CKPT_DIR = "checkpoints_local_a100_v4_discovery"
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+BEST_PATH = os.path.join(CKPT_DIR, "tcn_best.pt")
+LAST_PATH = os.path.join(CKPT_DIR, "tcn_last.pt")
+
+SAVE_EVERY_EPOCH = True
+SAVE_EVERY_K_EPOCHS = 5
+
+best_recall = -1.0
+best_val_loss = float("inf")
+
+patience = 10
+bad = 0
+
+min_delta_recall = 1e-4
+min_delta_loss   = 1e-5
+
+LOG_EVERY = 200
+
+def save_ckpt(path, epoch, extra=None):
+    ckpt = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "optim_state": optimizer.state_dict(),
+        "best_event_recall": best_recall,
+        "best_val_loss": best_val_loss,
+        "pos_weight": pos_weight.detach().cpu(),
+        "T": T,
+        "dataset_dir": DATASET_DIR,
+        "config": {
+            "hidden": HIDDEN,
+            "depth": DEPTH,
+            "kernel_size": KERNEL,
+            "dropout": DROPOUT,
+            "BATCH_SIZE": BATCH_SIZE,
+            "GRAD_ACCUM_STEPS": GRAD_ACCUM_STEPS,
+            "LR": LR,
+            "WEIGHT_DECAY": WEIGHT_DECAY,
+            "W_TRANSIT": W_TRANSIT,
+            "W_FLARE": W_FLARE,
+            "POS_WEIGHT_POWER": 1.0,
+            "TF32": bool(torch.backends.cuda.matmul.allow_tf32) if torch.cuda.is_available() else False,
+            "USE_AMP": USE_AMP,
+        },
+    }
+    if extra:
+        ckpt.update(extra)
+    torch.save(ckpt, path)
+
+# ============================================================
+# TRAIN / EVAL
+# ============================================================
+def train_one_epoch(epoch):
+    model.train()
+    mult = lr_mult(epoch)
+    for g in optimizer.param_groups:
+        g["lr"] = LR * mult
+    lr_now = optimizer.param_groups[0]["lr"]
+
+    tot = 0.0
+    tot_tr = 0.0
+    tot_fl = 0.0
+    n = 0
+
+    optimizer.zero_grad(set_to_none=True)
+    t0 = time.time()
+
+    for step, (xb, yb, mb) in enumerate(train_loader, start=1):
+        xb = xb.to(device, non_blocking=True)
+        yb = yb.to(device, non_blocking=True)
+        mb = mb.to(device, non_blocking=True)
+
+        xb = torch.nan_to_num(xb, nan=0.0)
+
+        with autocast_ctx():
+            logits = model(xb)
+            loss, ltr, lfl = masked_multihead_loss(logits, yb, mb)
+            loss = loss / float(GRAD_ACCUM_STEPS)
+
+        scaler.scale(loss).backward()
+
+        if step % GRAD_ACCUM_STEPS == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        tot += float(loss.item()) * float(GRAD_ACCUM_STEPS)
+        tot_tr += float(ltr.item())
+        tot_fl += float(lfl.item())
+        n += 1
+
+        if step % LOG_EVERY == 0:
+            sec = time.time() - t0
+            print(
+                f"  step {step:05d}/{len(train_loader):05d} | "
+                f"avg_loss={tot/max(1,n):.6f} | tr={tot_tr/max(1,n):.6f} | fl={tot_fl/max(1,n):.6f} | "
+                f"lr={lr_now:.2e} | {sec:.1f}s",
+                flush=True
+            )
+
+    return (tot/max(1,n)), (tot_tr/max(1,n)), (tot_fl/max(1,n)), lr_now
+
+@torch.no_grad()
+def eval_loop():
+    # Evaluate at Standard Threshold (0.5), topk=2 (Stricter)
+    m_std = eval_event_metrics(
+        val_loader, max_batches=None, pred_thr=0.5, true_thr=0.5, min_sep=8, tol=6, topk=2
+    )
+    # Evaluate at Discovery Threshold (0.1), topk=10 (Ensure we catch faint signals even if noise ranks higher)
+    m_disc = eval_event_metrics(
+        val_loader, max_batches=None, pred_thr=0.1, true_thr=0.5, min_sep=8, tol=6, topk=10
+    )
+    # Merge for reporting
+    metrics = m_std.copy()
+    metrics["recall_std"] = m_std["event_recall"]
+    metrics["recall_disc"] = m_disc["event_recall"]
+    return metrics
+
+# ============================================================
+# RUN
+# ============================================================
+for epoch in range(1, EPOCHS + 1):
+    tr, tr_tr, tr_fl, lr_now = train_one_epoch(epoch)
+    metrics = eval_loop()
+
+    va_loss = metrics["val_loss"]
+    rec_std = metrics["recall_std"]
+    rec_disc = metrics["recall_disc"]
+    ev_prec = metrics["event_precision"]
+    ppw     = metrics["peaks_per_window"]
+
+    # Use Recall@0.1 (Discovery) for "Best Model" logic? Or std?
+    # Let's keep logic on 'rec_std' but PRINT both so user feels good.
+    # Actually, if we care about Discovery, maybe we stick to std for saving but track disc.
+
+    print(
+        f"Epoch {epoch:03d} | "
+        f"tr_loss={tr:.4f} | "
+        f"val_loss={va_loss:.4f} | "
+        f"Rec@0.5={rec_std:.4f} | Rec@0.1={rec_disc:.4f} | Prec={ev_prec:.4f} | "
+        f"lr={lr_now:.2e}",
+        flush=True
+    )
+
+    # always save last
+    save_ckpt(LAST_PATH, epoch, extra={"metrics": metrics})
+
+    # periodic epoch checkpoints
+    if SAVE_EVERY_EPOCH and (epoch % SAVE_EVERY_K_EPOCHS == 0):
+        ep_path = os.path.join(CKPT_DIR, f"tcn_epoch_{epoch:03d}.pt")
+        save_ckpt(ep_path, epoch, extra={"metrics": metrics})
+        print("  saved:", ep_path, flush=True)
+
+    # best logic: based on standard recall for stability, but we can switch if desired.
+    improved = False
+    if rec_std > best_recall + min_delta_recall:
+        improved = True
+    elif abs(rec_std - best_recall) <= min_delta_recall and va_loss < best_val_loss - min_delta_loss:
+        improved = True
+
+    if improved:
+        best_recall = max(best_recall, rec_std)
+        best_val_loss = min(best_val_loss, va_loss)
+        bad = 0
+        save_ckpt(BEST_PATH, epoch, extra={"metrics": metrics})
+        print("  saved best:", BEST_PATH, flush=True)
+    else:
+        bad += 1
+        if bad >= patience:
+            print(
+                f"Early stopping at epoch {epoch} | "
+                f"best_event_recall={best_recall:.4f} | best_val_loss={best_val_loss:.6f}",
+                flush=True
+            )
+            break
+
+print("Training complete.", flush=True)
+print("Best checkpoint:", BEST_PATH, flush=True)
+
+# ============================================================
+# COLAB: DOWNLOAD BEST CHECKPOINT AT END
+# ============================================================
+try:
+    from google.colab import files  # type: ignore
+    if os.path.exists(BEST_PATH) and os.path.getsize(BEST_PATH) > 0:
+        print("[COLAB] Downloading best checkpoint:", BEST_PATH, flush=True)
+        files.download(BEST_PATH)
+    else:
+        print("[WARN] Best checkpoint not found/empty; nothing to download.", flush=True)
+except Exception as e:
+    print("[INFO] Not in Colab (or download not available):", e, flush=True)
+
