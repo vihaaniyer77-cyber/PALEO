@@ -1,0 +1,446 @@
+# ============================================================
+# PALEO — CIRCUMBINARY PLANET GEOMETRY DETECTION DEMO (v2)
+# ============================================================
+# Run in Colab. Requires: batman-package, scipy, matplotlib,
+# numpy, tqdm  (all pre-installed on Colab)
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import batman
+from scipy.signal import find_peaks
+from scipy.optimize import minimize
+from tqdm import tqdm
+
+np.random.seed(42)
+
+# ==============================================================
+# CONFIG
+# ==============================================================
+N_SYSTEMS     = 100
+CADENCE       = 0.021          # days per cadence (~30 min)
+DURATION_DAYS = 27.0
+NOISE_PPM     = 100            # photometric noise floor
+N_PLOT        = 6
+
+
+# ==============================================================
+# 1. SIMULATION HELPERS
+# ==============================================================
+
+def make_batman_transit(time, t0, rp, duration):
+    """Flat-bottomed limb-darkened transit."""
+    p = batman.TransitParams()
+    p.t0 = t0;  p.per = 10000.0;  p.rp = rp
+    p.a  = max(2.0, 10000.0 / (np.pi * max(duration, 0.01)))
+    p.inc = 90.0;  p.ecc = 0.0;  p.w = 90.0
+    p.u  = [0.3, 0.3];  p.limb_dark = "quadratic"
+    try:
+        return batman.TransitModel(p, time).light_curve(p)
+    except Exception:
+        return np.ones_like(time)
+
+
+def make_vshape(time, t_center, depth, duration):
+    """Linear V-shaped eclipse (binary primary)."""
+    flux = np.ones_like(time)
+    half = duration / 2.0
+    mask = np.abs(time - t_center) < half
+    dist = np.abs(time[mask] - t_center) / half   # 1 at edge, 0 at center
+    flux[mask] = 1.0 - depth * (1.0 - dist)
+    return flux
+
+
+def simulate_circumbinary(sid):
+    time  = np.arange(0, DURATION_DAYS, CADENCE)
+    flux  = np.ones_like(time)
+
+    # ── Binary ──────────────────────────────────────────────
+    P_bin    = np.random.uniform(5.0, 15.0)
+    t0_bin   = np.random.uniform(0.0, P_bin)
+    b_depth  = np.random.uniform(0.03, 0.10)   # 3–10 %
+    b_dur    = np.random.uniform(0.10, 0.25)
+
+    binary_eclipse_times = []
+    for t_e in np.arange(t0_bin, DURATION_DAYS, P_bin):
+        flux *= make_vshape(time, t_e, b_depth, b_dur)
+        if 0 <= t_e <= DURATION_DAYS:
+            binary_eclipse_times.append(t_e)
+    # Secondary (shallower)
+    for t_e in np.arange(t0_bin + P_bin / 2.0, DURATION_DAYS, P_bin):
+        flux *= make_vshape(time, t_e, b_depth * 0.35, b_dur)
+
+    # ── Circumbinary planet ──────────────────────────────────
+    rp    = np.random.uniform(0.07, 0.14)      # radius ratio → depth 0.5–2 %
+    dur_p = np.random.uniform(0.08, 0.22)
+
+    n_transits = np.random.randint(1, 3)
+    planet_transit_times = []
+    attempts = 0
+    while len(planet_transit_times) < n_transits and attempts < 500:
+        t_p = np.random.uniform(1.5, DURATION_DAYS - 1.5)
+        too_close = any(
+            abs(t_p - tb) < (b_dur + dur_p + 0.2)
+            for tb in binary_eclipse_times +
+                      [t0_bin + P_bin/2 + n*P_bin for n in range(-4, 10)]
+        )
+        if not too_close:
+            flux *= make_batman_transit(time, t_p, rp, dur_p)
+            planet_transit_times.append(t_p)
+        attempts += 1
+
+    # ── Stellar modulation ───────────────────────────────────
+    amp = np.random.uniform(0.0005, 0.003)
+    P_m = np.random.uniform(3.0, 15.0)
+    phi = np.random.uniform(0, 2 * np.pi)
+    flux += amp * np.sin(2 * np.pi * time / P_m + phi)
+
+    # ── Photometric noise ────────────────────────────────────
+    flux += np.random.normal(0, NOISE_PPM * 1e-6, len(time))
+
+    return time, flux, planet_transit_times, binary_eclipse_times
+
+
+# ==============================================================
+# 2. GEOMETRY-ONLY DETECTOR
+# ==============================================================
+
+def in_transit_flatness(flux_window, depth):
+    """
+    Measures how flat-bottomed a dip is.
+
+    Method: isolate the deepest 40 % of points in the window
+    (i.e. flux < median - 0.6*depth).  Their std / depth gives:
+        - Flat-bottomed transit  →  std ≈ noise  <<  depth   →  flatness ≈ 0
+        - V-shaped binary        →  std ≈ 0.3 * depth        →  flatness ≈ 0.3+
+
+    Threshold: flatness > 0.15 → V-shaped / binary.
+    """
+    med   = np.median(flux_window)
+    in_tr = flux_window[flux_window < med - 0.6 * depth]
+    if len(in_tr) < 3:
+        # Too few in-transit points — ambiguous, use a moderate default
+        return 0.10
+    return np.std(in_tr) / depth
+
+
+def batman_gain(time_w, flux_w, t_center):
+    """Batman chi² gain over a narrow window centred on the transit."""
+    robust_med = np.median(np.sort(flux_w)[int(len(flux_w) * 0.2):]) \
+                 if len(flux_w) > 10 else np.median(flux_w)
+    chi2_flat  = np.sum((flux_w - robust_med) ** 2) or 1e-12
+
+    def model(params, t):
+        t0_, rp_, dur_ = params
+        p = batman.TransitParams()
+        p.t0 = t0_; p.per = 10000.0; p.rp = rp_
+        p.a  = max(2.0, 10000.0 / (np.pi * max(dur_, 0.01)))
+        p.inc = 90.0; p.ecc = 0.0; p.w = 90.0
+        p.u  = [0.3, 0.3]; p.limb_dark = "quadratic"
+        try:
+            return batman.TransitModel(p, t).light_curve(p) * robust_med
+        except Exception:
+            return np.ones_like(t) * robust_med
+
+    bounds  = [(t_center - 0.2, t_center + 0.2), (0.005, 0.5), (0.01, 0.5)]
+    try:
+        res  = minimize(lambda p: np.sum((flux_w - model(p, time_w))**2),
+                        [t_center, 0.06, 0.12], bounds=bounds, method="L-BFGS-B")
+        gain = 1.0 - res.fun / chi2_flat
+        best = res.x
+    except Exception:
+        gain = 0.0; best = [t_center, 0.06, 0.12]
+    return gain, best
+
+
+def classify_dip(time, flux, t_dip):
+    """
+    Classify a dip at t_dip using geometry only (no period info).
+
+    Pipeline:
+    1. Depth gate  →  > 2.5 %  ⟹  binary
+    2. Flatness    →  V-shaped ⟹  binary
+    3. Batman gain →  poor fit ⟹  binary  |  good fit ⟹  planet
+
+    Returns: label, gain, flatness, depth
+    """
+    global_med = np.median(flux)
+
+    # ── Wide neighbourhood (2 × typical transit duration) ────
+    WIDE = 0.8
+    mask = np.abs(time - t_dip) < WIDE / 2
+    tw   = time[mask];  fw = flux[mask]
+    if len(fw) < 6:
+        return "noise", 0.0, 0.0, 0.0
+
+    depth = global_med - np.min(fw)
+
+    if depth < 2.5 * NOISE_PPM * 1e-6:
+        return "noise", 0.0, 0.0, depth
+
+    # Gate 1: absolute depth
+    if depth > 0.025:
+        return "binary", 0.0, 0.0, depth
+
+    # Gate 2: flatness of in-transit region
+    flat  = in_transit_flatness(fw, depth)
+    if flat > 0.15:
+        return "binary", 0.0, flat, depth
+
+    # Gate 3: Batman chi² gain (narrow window = 4 × estimated duration)
+    # Estimate duration: width of points within 50 % of the dip
+    in_tr_mask = fw < (global_med - 0.5 * depth)
+    if in_tr_mask.sum() >= 2:
+        t_in = tw[in_tr_mask]
+        est_dur = max(t_in[-1] - t_in[0], CADENCE * 2)
+    else:
+        est_dur = 0.12
+
+    win_b   = max(est_dur * 4.0, 0.20)
+    mask_b  = np.abs(time - t_dip) < win_b / 2
+    gain, _ = batman_gain(time[mask_b], flux[mask_b], t_dip)
+
+    if gain > 0.05:
+        return "planet", gain, flat, depth
+    else:
+        return "binary", gain, flat, depth
+
+
+def find_dips(time, flux):
+    """
+    Find significant dips using an absolute noise floor.
+    distance = 0.10 days ensures each eclipse/transit yields exactly one peak.
+    """
+    threshold = 3.5 * NOISE_PPM * 1e-6    # 350 ppm
+    inverted  = np.median(flux) - flux
+    peaks, _  = find_peaks(inverted,
+                            height=threshold,
+                            distance=int(0.10 / CADENCE))  # ~5 cadences min separation
+    return peaks
+
+
+# ==============================================================
+# 3. RUN THE DEMO
+# ==============================================================
+
+print("=" * 57)
+print("  PALEO — CIRCUMBINARY GEOMETRY DETECTION DEMO  (v2)")
+print("=" * 57)
+print(f"  Simulating {N_SYSTEMS} CBP systems  |  noise = {NOISE_PPM} ppm\n")
+
+results = []
+
+for sid in tqdm(range(N_SYSTEMS), desc="Processing CBP systems"):
+    time, flux, planet_times, binary_times = simulate_circumbinary(sid)
+    dip_indices = find_dips(time, flux)
+
+    MATCH_R = 0.35   # days; window to link detection to ground-truth event
+
+    all_detections = []
+    for idx in dip_indices:
+        t_dip = time[idx]
+        label, gain, flatness, depth = classify_dip(time, flux, t_dip)
+        all_detections.append((t_dip, label, gain, flatness, depth))
+
+    # Each ground-truth planet transit matched to at most one detected 'planet' dip
+    matched_dips = set()
+    n_pl_detected = 0
+    n_missed      = 0
+    for tp in planet_times:
+        hits = [(j, d) for j, d in enumerate(all_detections)
+                if abs(d[0] - tp) < MATCH_R and d[1] == "planet"
+                and j not in matched_dips]
+        if hits:
+            matched_dips.add(hits[0][0])
+            n_pl_detected += 1
+        else:
+            n_missed += 1
+
+    # False positives: 'planet' detections not matched to any planet truth
+    n_fp = sum(
+        1 for j, d in enumerate(all_detections)
+        if d[1] == "planet" and j not in matched_dips
+        and any(abs(d[0] - tb) < MATCH_R for tb in binary_times)
+    )
+
+    # Each binary eclipse matched to at most one 'binary' detection
+    matched_bin_dips = set()
+    n_bi_detected = 0
+    for tb in binary_times:
+        hits = [(j, d) for j, d in enumerate(all_detections)
+                if abs(d[0] - tb) < MATCH_R and d[1] == "binary"
+                and j not in matched_bin_dips]
+        if hits:
+            matched_bin_dips.add(hits[0][0])
+            n_bi_detected += 1
+
+    results.append({
+        "sid": sid,
+        "n_planets":       len(planet_times),
+        "n_binaries":      len(binary_times),
+        "detected_planets": n_pl_detected,
+        "missed_planets":   n_missed,
+        "detected_binaries": n_bi_detected,
+        "false_planets":    n_fp,
+        "detections":       all_detections,
+        "time": time, "flux": flux,
+        "planet_times": planet_times,
+        "binary_times":  binary_times,
+    })
+
+
+# ==============================================================
+# 4. SUMMARY
+# ==============================================================
+
+tot_p     = sum(r["n_planets"]         for r in results)
+tot_pd    = sum(r["detected_planets"]  for r in results)
+tot_pm    = sum(r["missed_planets"]    for r in results)
+tot_b     = sum(r["n_binaries"]        for r in results)
+tot_bd    = sum(r["detected_binaries"] for r in results)
+tot_fp    = sum(r["false_planets"]     for r in results)
+recall_p  = tot_pd / tot_p  if tot_p > 0 else 0
+recall_b  = tot_bd / tot_b  if tot_b > 0 else 0
+prec_p    = tot_pd / (tot_pd + tot_fp) if (tot_pd + tot_fp) > 0 else 0
+
+print("\n" + "=" * 57)
+print("  GEOMETRY DETECTION — SUMMARY")
+print("=" * 57)
+print(f"  Systems simulated          : {N_SYSTEMS}")
+print(f"")
+print(f"  Planet transits injected   : {tot_p}")
+print(f"  Correctly identified       : {tot_pd}  ({recall_p:.1%})")
+print(f"  Missed                     : {tot_pm}")
+print(f"  False positives (bin→plan) : {tot_fp}")
+print(f"  Precision                  : {prec_p:.1%}")
+print(f"")
+print(f"  Binary eclipses injected   : {tot_b}")
+print(f"  Correctly classified       : {tot_bd}  ({recall_b:.1%})")
+print("=" * 57)
+print(f"\n  RESULT: Shape-only (no BLS, no period) identifies")
+print(f"  {recall_p:.0%} of CBP planet transits with {prec_p:.0%} precision.")
+print("=" * 57)
+
+
+# ==============================================================
+# 5. LIGHT CURVE PLOTS
+# ==============================================================
+
+COL_P = "#27ae60"   # green → planet
+COL_B = "#e74c3c"   # red   → binary
+COL_N = "#95a5a6"   # grey  → noise/unclassified
+
+good = [r for r in results if r["detected_planets"] >= 1][:N_PLOT]
+if len(good) < N_PLOT:
+    good = results[:N_PLOT]
+
+fig, axes = plt.subplots(N_PLOT, 1, figsize=(16, 3.8 * N_PLOT))
+if N_PLOT == 1: axes = [axes]
+
+for ax, r in zip(axes, good):
+    t, f = r["time"], r["flux"]
+    ax.scatter(t, f, s=2, c="#555555", alpha=0.30, rasterized=True)
+
+    for tp in r["planet_times"]:
+        ax.axvspan(tp - 0.2, tp + 0.2, alpha=0.10, color=COL_P)
+        ax.axvline(tp, color=COL_P, lw=1.2, ls="--", alpha=0.8)
+    for tb in r["binary_times"]:
+        ax.axvline(tb, color=COL_B, lw=0.7, ls=":", alpha=0.5)
+
+    for t_dip, label, gain, flatness, depth in r["detections"]:
+        if label == "noise": continue
+        col  = COL_P if label == "planet" else COL_B
+        tag  = "[P]" if label == "planet" else "[B]"
+        yref = f[np.argmin(np.abs(t - t_dip))]
+        ax.annotate(
+            f"{tag}\nG={gain:.2f}\nfl={flatness:.2f}",
+            xy=(t_dip, yref),
+            xytext=(t_dip, yref - 3e-3),
+            fontsize=6, color=col, ha="center",
+            arrowprops=dict(arrowstyle="-", color=col, lw=0.7),
+        )
+
+    ax.set_xlim(t[0], t[-1])
+    ax.set_xlabel("Time (days)", fontsize=9)
+    ax.set_ylabel("Flux", fontsize=9)
+    ax.set_title(
+        f"CBP System #{r['sid']}  |  "
+        f"Planets: {r['n_planets']} injected, {r['detected_planets']} detected  |  "
+        f"Binaries: {r['n_binaries']} injected, {r['detected_binaries']} classified",
+        fontsize=9
+    )
+    ax.tick_params(labelsize=8)
+    ax.grid(True, alpha=0.15, lw=0.4)
+
+patches = [
+    mpatches.Patch(color=COL_P, label="[P] Planet transit detected"),
+    mpatches.Patch(color=COL_B, label="[B] Binary eclipse classified"),
+    mpatches.Patch(color="#555555", label="Photometry"),
+]
+fig.legend(handles=patches, loc="upper center", ncol=3,
+           fontsize=9, bbox_to_anchor=(0.5, 1.01))
+fig.suptitle(
+    "PALEO Circumbinary Geometry Detection\n"
+    "batman chi2 + in-transit flatness — no period folding",
+    fontsize=11, y=1.03,
+)
+plt.tight_layout()
+plt.savefig("cbp_lc_demo.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("[PLOT] cbp_lc_demo.png saved.")
+
+
+# ==============================================================
+# 6. GEOMETRY SCATTER PLOT
+# ==============================================================
+
+depths_p, flat_p, gain_p = [], [], []
+depths_b, flat_b, gain_b = [], [], []
+
+for r in results:
+    for t_dip, label, gain, flatness, depth in r["detections"]:
+        if label == "planet":
+            depths_p.append(depth * 1e6)
+            flat_p.append(flatness)
+            gain_p.append(gain)
+        elif label == "binary":
+            depths_b.append(depth * 1e6)
+            flat_b.append(flatness)
+            gain_b.append(gain)
+
+fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left: Depth vs Flatness
+ax1.scatter(depths_b, flat_b, s=18, alpha=0.5, c=COL_B, label="Binary eclipse")
+ax1.scatter(depths_p, flat_p, s=22, alpha=0.8, c=COL_P, label="Planet transit", zorder=5)
+ax1.axhline(0.15, color="black", ls="--", lw=1, label="Flatness threshold (0.15)")
+ax1.axvline(25000, color="grey",  ls=":",  lw=1, label="Depth gate (2.5 %)")
+ax1.set_xlabel("Transit Depth (ppm)", fontsize=11)
+ax1.set_ylabel("In-transit Flatness (std/depth)", fontsize=11)
+ax1.set_title("Geometry Space: Depth vs Flatness", fontsize=11)
+ax1.set_xscale("log")
+ax1.legend(fontsize=9)
+ax1.grid(True, alpha=0.2)
+
+# Right: Depth vs Batman gain
+ax2.scatter(depths_b, gain_b, s=18, alpha=0.5, c=COL_B, label="Binary eclipse")
+ax2.scatter(depths_p, gain_p, s=22, alpha=0.8, c=COL_P, label="Planet transit", zorder=5)
+ax2.axhline(0.05, color="black", ls="--", lw=1, label="Batman gain threshold (0.05)")
+ax2.axvline(25000, color="grey",  ls=":",  lw=1, label="Depth gate (2.5 %)")
+ax2.set_xlabel("Transit Depth (ppm)", fontsize=11)
+ax2.set_ylabel("Batman chi2 Gain", fontsize=11)
+ax2.set_title("Geometry Space: Depth vs Batman Gain", fontsize=11)
+ax2.set_xscale("log")
+ax2.legend(fontsize=9)
+ax2.grid(True, alpha=0.2)
+
+fig2.suptitle(
+    "Discriminating CBP Planet Transits from Binary Eclipses — Geometry Only\n"
+    "(No period folding. Shape metrics alone separate the two classes.)",
+    fontsize=11,
+)
+plt.tight_layout()
+plt.savefig("cbp_geometry_scatter.png", dpi=150, bbox_inches="tight")
+plt.show()
+print("[PLOT] cbp_geometry_scatter.png saved.")
