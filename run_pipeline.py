@@ -1,16 +1,4 @@
-"""PALEO end-to-end inference on any TESS star.
 
-Given a TIC ID: fetch one sector of official-pipeline photometry from MAST,
-apply the standard ingestion rules, resample to the 10-minute grid, run the
-neural detector, extract events, and run the Stage 2 periodicity search.
-
-Usage:
-    python run_pipeline.py --tic 115591768
-    python run_pipeline.py --tic 115591768 --sector 14 --plot out.png
-
-Requires: the paleo package on PYTHONPATH (repo root), lightkurve, torch,
-and the frozen checkpoint (default models/paleo_unet_v1.pt, or --model).
-"""
 import argparse
 
 import numpy as np
@@ -20,9 +8,7 @@ from paleo.detect import (DUR_DEFAULT, knee_cut_scores, load_model, nn_events,
                           nn_score)
 from paleo.stage2 import stage2_search
 
-# Ingestion rules (Technical Reference A.1): official pipelines only, in
-# priority order, with each pipeline's systematics-corrected flux column.
-# QLP renamed its corrected column at Sector 56, hence the priority list.
+
 AUTHORS = ("SPOC", "TESS-SPOC", "QLP")
 FLUX_COLUMNS = {
     "SPOC": ["pdcsap_flux"],
